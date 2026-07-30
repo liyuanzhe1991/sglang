@@ -408,8 +408,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             metadata.max_seq_len_q = num_tokens_per_req
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Mirror the target_verify handling: the kernel scans the local
+            # stripe (seq_lens_k) while causality is applied against global
+            # positions (global_seq_lens_k passed as causal_seqs).
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(
+                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
+            )
+            local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
             local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
@@ -431,7 +437,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(

@@ -401,6 +401,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 (bs,), num_tokens_per_req, dtype=torch.int32, device=device
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+            metadata.global_seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
 
         # Capture with full width so future longer sequences are safe during replay.
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
@@ -1055,6 +1058,52 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     metadata.seq_lens_k,
                     dense_q_indptr,
                     draft_token_num,
+                )
+                return output.flatten(1), lse
+
+            if (
+                forward_batch.forward_mode.is_draft_extend_v2()
+                and get_parallel().dcp_enabled
+            ):
+                # DCP draft-extend mirrors the target-verify path above: a
+                # uniform [bs, q_len] window scanned against the local KV
+                # stripe, causality applied inside the kernel via global
+                # positions, LSE returned for the cross-rank merge.
+                assert not needs_unpad, (
+                    "DCP draft-extend requires a uniform draft window "
+                    "(chain-style verify, topk 1)."
+                )
+                raw_out, lse = self._run_decode_kernel(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_tables=metadata.block_kv_indices,
+                    seq_lens=metadata.seq_lens_k,
+                    max_seq_len=max_seq_len,
+                    layer=layer,
+                    causal_seqs=metadata.global_seq_lens_k,
+                    cp_world=get_parallel().dcp_size,
+                    cp_rank=get_parallel().dcp_rank,
+                    return_lse=True,
+                )
+                output = raw_out.view(
+                    bs * tokens_per_seq,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+                lse = lse.view(bs * tokens_per_seq, layer.tp_q_head_num)
+                dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * tokens_per_seq,
+                    tokens_per_seq,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                fixup_zero_kv_rows(
+                    output,
+                    lse,
+                    metadata.seq_lens_k,
+                    dense_q_indptr,
+                    tokens_per_seq,
                 )
                 return output.flatten(1), lse
 
