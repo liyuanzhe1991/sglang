@@ -3767,11 +3767,40 @@ class ServerArgs:
                     and self.speculative_attention_mode == "decode"
                     and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
-                if kimi_linear_dspark:
+                # NEXTN has not been normalized to EAGLE yet: this validation
+                # runs before handle_speculative_decoding resolves the alias.
+                deepseek_mla_eagle = (
+                    self.speculative_algorithm in ("NEXTN", "EAGLE")
+                    and any(
+                        arch in model_arches
+                        for arch in (
+                            "DeepseekV3ForCausalLM",
+                            "DeepseekV2ForCausalLM",
+                        )
+                    )
+                    and self.speculative_attention_mode == "decode"
+                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
+                    # Chain-style verify only: the DCP verify kernels apply
+                    # causality via causal_seqs and ignore the tree mask, and
+                    # move_kv_cache has no DCP ownership handling (topk>1
+                    # accept-path relocation would corrupt striped KV).
+                    and (self.speculative_eagle_topk or 1) == 1
+                    # tokenspeed decode kernel workspace bound (MAX_Q_LEN=8).
+                    and (self.speculative_num_draft_tokens or 1) <= 8
+                    # The flashinfer_mla draft path bypasses DCP kv-index
+                    # striping when spec_info is set; only the tokenspeed /
+                    # cutedsl multi-step draft backends are DCP-aware.
+                    and (
+                        self.speculative_draft_attention_backend is None
+                        or self.speculative_draft_attention_backend
+                        in ("tokenspeed_mla", "cutedsl_mla")
+                    )
+                )
+                if kimi_linear_dspark or deepseek_mla_eagle:
                     ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
                     if ragged_verify_mode != "static":
                         raise ValueError(
-                            "Kimi Linear DCP + DSPARK currently requires "
+                            "DCP + speculative decoding currently requires "
                             "SGLANG_RAGGED_VERIFY_MODE=static, but got "
                             f"{ragged_verify_mode!r}."
                         )
@@ -3780,13 +3809,18 @@ class ServerArgs:
                         "Decode context parallel (--dcp-size / "
                         "--decode-context-parallel-size > 1) with speculative "
                         "decoding on CUDA is supported only for Kimi Linear + "
-                        "DSPARK + --speculative-attention-mode decode + "
-                        "tokenspeed_mla, or experimental cutedsl_mla, but got "
+                        "DSPARK or DeepSeek MLA + NEXTN/EAGLE (chain-style, "
+                        "topk 1, <= 8 draft tokens), each with "
+                        "--speculative-attention-mode decode + tokenspeed_mla "
+                        "or experimental cutedsl_mla, but got "
                         f"architectures={model_arches}, "
                         f"speculative_algorithm={self.speculative_algorithm!r}, "
                         "speculative_attention_mode="
                         f"{self.speculative_attention_mode!r}, "
-                        f"decode_attention_backend={decode_backend!r}."
+                        f"decode_attention_backend={decode_backend!r}, "
+                        f"speculative_eagle_topk={self.speculative_eagle_topk!r}, "
+                        "speculative_num_draft_tokens="
+                        f"{self.speculative_num_draft_tokens!r}."
                     )
         else:
             raise ValueError(

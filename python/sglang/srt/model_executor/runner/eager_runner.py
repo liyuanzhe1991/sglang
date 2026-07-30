@@ -263,8 +263,16 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
-            if model_runner.dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.dcp_size > 1
+                # Target-verify / draft-extend take the decode-phase DCP route
+                # and carry no extend_prefix_lens (the builder would crash on
+                # None); only real extend batches need the KV-gather metadata.
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (

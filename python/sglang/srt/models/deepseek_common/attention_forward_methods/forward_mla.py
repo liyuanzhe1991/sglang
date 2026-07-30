@@ -93,7 +93,13 @@ def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
         return False
     if forward_batch.forward_mode.is_decode():
         return True
-    if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
+    # Target-verify and (EAGLE) draft-extend are multi-token decode-phase
+    # forwards: they must take the DCP decode route (full-head Q + local KV
+    # stripe + cross-rank LSE merge), not the extend KV-gather route.
+    if not (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    ) or not _is_cuda:
         return False
 
     server_args = get_server_args()
@@ -101,7 +107,8 @@ def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
         server_args.decode_attention_backend or server_args.attention_backend
     )
     return (
-        server_args.speculative_algorithm == "DSPARK"
+        # NEXTN is normalized to EAGLE before model init.
+        server_args.speculative_algorithm in ("DSPARK", "EAGLE")
         and server_args.speculative_attention_mode == "decode"
         and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
     )
