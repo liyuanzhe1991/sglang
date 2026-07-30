@@ -5,6 +5,7 @@ Support attention backend for TRTLLM MLA kernels from flashinfer.
 from __future__ import annotations
 
 import logging
+import os
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -1022,6 +1023,34 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and get_parallel().dcp_enabled
+                and os.environ.get("SGLANG_DCP_VERIFY_DEBUG") == "1"
+                and layer.layer_id in (0, 1)
+            ):
+                par = get_parallel()
+                gl = metadata.global_seq_lens_k[:bs].tolist()
+                ll = metadata.seq_lens_k[:bs].tolist()
+                exp_ll = [
+                    g // par.dcp_size + (1 if par.dcp_rank < g % par.dcp_size else 0)
+                    for g in gl
+                ]
+                locs = forward_batch.out_cache_loc
+                pos = forward_batch.positions
+                mod_ok = bool(
+                    ((locs % par.dcp_size) == (pos % par.dcp_size)).all().item()
+                )
+                bt_rows = (metadata.block_kv_indices[:bs] >= 0).sum(-1).tolist()
+                logger.warning(
+                    "[DCP-VERIFY-DEBUG] rank=%s layer=%s bs=%s q=%s global=%s "
+                    "local=%s expect_local=%s local_ok=%s slotmod_ok=%s "
+                    "bt_pages=%s max_seq_len=%s pos0=%s",
+                    par.dcp_rank, layer.layer_id, bs, q.shape[1],
+                    gl[:4], ll[:4], exp_ll[:4], ll == exp_ll, mod_ok,
+                    bt_rows[:4], max_seq_len, pos[: min(6, pos.numel())].tolist(),
+                )
 
             if (
                 forward_batch.forward_mode.is_target_verify()

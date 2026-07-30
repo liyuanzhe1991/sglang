@@ -179,7 +179,14 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     global_server_args = get_server_args()
-    page_size = global_server_args.page_size
+    # Align with the ALLOCATOR's page size, not the raw server page size:
+    # under DCP the allocator hands out superpages (page_size * dcp_size), and
+    # a raw-page-aligned start_p can land inside the superpage that
+    # cache_finished_req's tail frees already released — free_segment then
+    # frees that superpage a second time, the free-page list gains a
+    # duplicate, and two requests are later handed the same page (silent KV
+    # cross-clobbering).
+    page_size = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated

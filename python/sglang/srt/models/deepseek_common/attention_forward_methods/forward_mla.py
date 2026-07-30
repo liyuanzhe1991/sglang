@@ -88,6 +88,58 @@ class MlaBmmFusionPlan:
     attn_output_buf: torch.Tensor
 
 
+def _dump_verify_layer0_debug(
+    stage: str, layer_id: int, forward_batch: ForwardBatch, **tensors
+) -> None:
+    """Temporary DCP-verify debugging aid; env-gated, first real step only."""
+    import os
+
+    tag = os.environ.get("SGLANG_DCP_VERIFY_DUMP")
+    if tag is None or layer_id != 0:
+        return
+    if not forward_batch.forward_mode.is_target_verify():
+        return
+    if torch.cuda.is_current_stream_capturing():  # .item() is illegal in capture
+        return
+    if forward_batch.positions.max().item() < 40:  # skip warmup batches
+        return
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if stage == "final" and rank == 0 and os.environ.get("SGLANG_DCP_ROW_AUDIT"):
+        # Per-step slot-bookkeeping audit: req_to_token row + window slots.
+        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+
+        s_global = int(forward_batch.positions.max().item()) + 1
+        row_path = f"/tmp/vdump_{tag}_row_S{s_global}.pt"
+        if not os.path.exists(row_path) and len(
+            [f for f in os.listdir("/tmp") if f.startswith(f"vdump_{tag}_row_")]
+        ) < 120:
+            req0 = int(forward_batch.req_pool_indices[0].item())
+            row = get_req_to_token_pool().req_to_token[req0][: s_global + 8]
+            torch.save(
+                {
+                    "S": s_global,
+                    "row": row.cpu(),
+                    "out_cache_loc": forward_batch.out_cache_loc.cpu(),
+                    "input_ids": forward_batch.input_ids.cpu(),
+                    "positions": forward_batch.positions.cpu(),
+                },
+                row_path,
+            )
+
+    path = f"/tmp/vdump_{tag}_{stage}_r{rank}.pt"
+    if os.path.exists(path):
+        return
+    payload = {
+        k: v.detach().to(torch.float32).cpu() for k, v in tensors.items()
+    }
+    payload["input_ids"] = forward_batch.input_ids.cpu()
+    payload["positions"] = forward_batch.positions.cpu()
+    torch.save(payload, path)
+
+
 def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     if not get_parallel().dcp_enabled:
         return False
@@ -853,6 +905,9 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
+            _dump_verify_layer0_debug(
+                "partial", self.layer_id, forward_batch, partial=attn_output, lse=lse
+            )
             dcp_comm_backend = get_server_args().dcp_comm_backend
             if dcp_comm_backend in ("a2a", "fi_a2a"):
                 # A2A exchange of head partials + LSE, then local Triton combine.
@@ -870,6 +925,9 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        _dump_verify_layer0_debug(
+            "final", self.layer_id, forward_batch, attn=attn_output
+        )
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
