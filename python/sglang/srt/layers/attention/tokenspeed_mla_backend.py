@@ -132,8 +132,15 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            # Under DCP the decode/verify kernels run on the DCP-gathered
+            # full-head query (num_q_heads * dcp_size heads); sizing the
+            # workspace with the per-rank head count silently overflows for
+            # multi-token (target-verify / draft-extend) windows.
+            workspace_num_heads = self.num_q_heads
+            if get_parallel().dcp_enabled:
+                workspace_num_heads *= get_parallel().dcp_size
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device, workspace_num_heads, self.kv_lora_rank
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
