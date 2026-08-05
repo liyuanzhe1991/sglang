@@ -84,6 +84,34 @@ def test_forward_varlen_skips_empty_trailing_segment():
     sageattn.assert_called_once()
 
 
+def test_forward_varlen_materializes_split_qkv_views_as_dense_nhd():
+    calls = []
+
+    def fake_sageattn(query, key, value, **_kwargs):
+        calls.append((query, key, value))
+        assert query.is_contiguous()
+        assert key.is_contiguous()
+        assert value.is_contiguous()
+        return query + key + value
+
+    impl = _impl(Mock(side_effect=fake_sageattn))
+    packed_qkv = torch.arange(6 * 2 * 12, dtype=torch.float32).reshape(6, 2, 12)
+    query, key, value = packed_qkv.chunk(3, dim=-1)
+    assert not query.is_contiguous()
+
+    output = impl.forward_varlen(
+        query,
+        key,
+        value,
+        cu_seqlens=torch.tensor([0, 5, 6], dtype=torch.int32),
+        cu_seqlens_host=(0, 5, 6),
+        max_seqlen=5,
+    )
+
+    torch.testing.assert_close(output, query + key + value)
+    assert [call[0].shape[1] for call in calls] == [5, 1]
+
+
 @pytest.mark.parametrize(
     "bounds",
     [

@@ -57,6 +57,14 @@ class SageAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        # SageAttention's CUDA kernels assume dense NHD/HND strides even though
+        # the public implementation only checks that the last dimension is
+        # contiguous. Fused MiniMax-H3 QKV projection and Ulysses both return
+        # split views whose last dimension is contiguous but whose sequence and
+        # head strides still include all three QKV tensors.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
         output = sageattn(
             query,
             key,
