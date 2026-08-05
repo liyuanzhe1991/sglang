@@ -63,7 +63,7 @@ class MiniMaxH3ReleaseMetadata:
         partition = raw.get("partition")
         if partition not in {"fl2va", "ref2va"}:
             raise ValueError(
-                "model_index.json._minimax_h3.partition must be one of " "fl2va, ref2va"
+                "model_index.json._minimax_h3.partition must be one of fl2va, ref2va"
             )
         tasks = _string_list(raw.get("tasks"), "model_index.json._minimax_h3.tasks")
         aliases = raw.get("task_aliases", {})
@@ -153,12 +153,6 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"
             )
         high_quality = quality == "high"
-        attention_backend = str(server_args.attention_backend or "").strip().lower()
-        if attention_backend == "sage_attn" and not batch.is_warmup:
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
         if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
             plan = minimax_h3_plan_from_batch(batch)

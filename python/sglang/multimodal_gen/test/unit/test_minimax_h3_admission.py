@@ -301,10 +301,31 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
-    with pytest.raises(ValueError, match="does not support SageAttention"):
-        stage.forward(batch, server_args)
+    assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+def test_sage_attention_server_admission_requires_package():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(attention_backend="sage_attn")
+
+    with (
+        patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "importlib.util.find_spec",
+            return_value=None,
+        ),
+        pytest.raises(ValueError, match="requires the sageattention package"),
+    ):
+        config.validate_server_args(server_args)
+
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+        "importlib.util.find_spec",
+        return_value=object(),
+    ):
+        config.validate_server_args(server_args)

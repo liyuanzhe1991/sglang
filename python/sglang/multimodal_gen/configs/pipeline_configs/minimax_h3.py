@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import importlib.util
 import os
 from dataclasses import dataclass, field
 
@@ -170,10 +171,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
         attention_backend = self._server_arg_value(server_args.attention_backend)
-        if str(attention_backend).strip().lower() == "sage_attn":
+        if (
+            str(attention_backend).strip().lower() == "sage_attn"
+            and importlib.util.find_spec("sageattention") is None
+        ):
             raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
+                "MiniMax-H3 SageAttention requires the sageattention package; "
+                "install sageattention==2.2.0 with SM90 kernels for Hopper"
             )
 
     def select_vae_weight_files(

@@ -34,7 +34,6 @@ class SageAttentionBackend(AttentionBackend):
 
 
 class SageAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -71,4 +70,50 @@ class SageAttentionImpl(AttentionImpl):
         if return_softmax_lse:
             output, softmax_lse = output
             return output, softmax_lse
+        return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        """Run packed attention without allowing tokens to cross segments.
+
+        SageAttention's architecture-dispatched ``sageattn`` entry point uses
+        the optimized SM-specific implementation, while its native varlen API
+        currently uses a separate Triton FP16-PV path. Execute each packed
+        segment as a batch-of-one so Hopper inputs continue to use the SM90
+        implementation and retain the exact packed-sequence boundaries.
+        """
+        del max_seqlen
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        if len(bounds) < 2 or bounds[0] != 0 or bounds[-1] != query.shape[0]:
+            raise ValueError(
+                "cu_seqlens must start at 0 and end at the packed query length"
+            )
+        if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+            raise ValueError("packed SageAttention requires matching Q/K/V lengths")
+        if any(stop < start for start, stop in zip(bounds[:-1], bounds[1:])):
+            raise ValueError("cu_seqlens must be monotonically non-decreasing")
+
+        output = torch.empty_like(query)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if start == stop:
+                continue
+            segment = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                None,
+            )
+            output[start:stop].copy_(segment[0])
         return output
