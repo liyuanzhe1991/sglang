@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import importlib.metadata
+
 import torch
 from sageattention import sageattn
 
@@ -15,6 +17,31 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _restore_sageattention_2_2_sm90_fused_op() -> bool:
+    """Restore the SM90 CUDA wrapper shadowed by SageAttention 2.2.0.
+
+    The 2.2.0 ``sm90_compile`` module registers the fused custom op correctly,
+    then accidentally reuses the same Python name for its fake implementation.
+    The dispatcher retains the real op, so point the module attribute used by
+    ``sageattn`` back at that registered CUDA implementation.
+    """
+    try:
+        if importlib.metadata.version("sageattention") != "2.2.0":
+            return False
+        from sageattention import sm90_compile
+
+        fused_op = torch.ops.sageattention_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+    except (AttributeError, ImportError, importlib.metadata.PackageNotFoundError):
+        return False
+
+    sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf = fused_op
+    return True
+
+
+if _restore_sageattention_2_2_sm90_fused_op():
+    logger.info("Restored SageAttention 2.2.0 SM90 fused CUDA op")
 
 
 class SageAttentionBackend(AttentionBackend):

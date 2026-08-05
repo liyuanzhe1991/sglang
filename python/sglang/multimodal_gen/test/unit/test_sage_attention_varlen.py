@@ -112,6 +112,36 @@ def test_forward_varlen_materializes_split_qkv_views_as_dense_nhd():
     assert [call[0].shape[1] for call in calls] == [5, 1]
 
 
+def test_restores_sageattention_2_2_sm90_fused_dispatcher_op():
+    module = _load_sage_backend(Mock())
+    fused_op = Mock()
+    sm90_compile = types.ModuleType("sageattention.sm90_compile")
+    sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf = Mock()
+    sageattention = types.ModuleType("sageattention")
+    sageattention.sm90_compile = sm90_compile
+    fake_ops = types.SimpleNamespace(
+        sageattention_sm90=types.SimpleNamespace(
+            qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf=fused_op
+        )
+    )
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "sageattention": sageattention,
+                "sageattention.sm90_compile": sm90_compile,
+            },
+        ),
+        patch.object(module.importlib.metadata, "version", return_value="2.2.0"),
+        patch.object(module.torch, "ops", fake_ops),
+    ):
+        restored = module._restore_sageattention_2_2_sm90_fused_op()
+
+    assert restored
+    assert sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf is fused_op
+
+
 @pytest.mark.parametrize(
     "bounds",
     [
