@@ -54,6 +54,9 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
+        # Producer indices whose load raised; their futures stay so a waiting
+        # consumer raises instead of reading never-loaded slots.
+        self.failed: set[int] = set()
 
     def update_producer(self) -> int:
         self.producer_index += 1
@@ -67,9 +70,22 @@ class LayerWiseLoadCounter:
         self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
+        self.failed.add(index)
         for future in self.futures.get(index, ()):
             if not future.done():
                 future.set_exception(error)
+
+    def release(self, index: int) -> None:
+        """Drop a fully loaded batch's futures.
+
+        A batch no forward waits on (its loads were not read by any batch)
+        would otherwise keep its futures forever; a later ``wait_until`` on a
+        released index returns at once, which is right because every layer
+        landed. Kept when a layer-ready hook (MLA dedup broadcast) is bound:
+        that hook runs from the consumer's wait and must see every layer.
+        """
+        if self.on_layer_ready is None and index not in self.failed:
+            self.futures.pop(index, None)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
@@ -90,6 +106,7 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures.clear()
+        self.failed.clear()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -154,6 +171,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        # Names this rank in failure reasons handed to the scheduler path.
+        self._rank_tag = storage_suffix
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -185,6 +204,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        # rid -> reason, for completed load batches that failed; consumed by
+        # the drain, which raises with the reason.
+        self.failed_loads: dict[str, str] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -270,6 +292,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def pop_completed_load(self) -> list[str]:
         return self.completed_loads.get_nowait()
+
+    def take_load_failure(self, rids: list[str]) -> str | None:
+        """Why any of these completed loads failed, None when all landed.
+
+        The failure is forgotten once taken. The reason names this rank and
+        the error (a Mooncake short read or exception), so the scheduler's
+        RuntimeError identifies the cause from any one rank's log.
+        """
+        reasons = [self.failed_loads.pop(rid) for rid in rids if rid in self.failed_loads]
+        return "; ".join(dict.fromkeys(reasons)) or None
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -360,13 +392,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 counter_index, pending, ready_event = task
                 replicated = counter_index in self.broadcast_loads
+                reason = "load thread did not run the batch"
                 try:
                     ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    reason = self.load_layer_wise(
+                        counter_index, list(pending.values())
+                    )
                 except BaseException as error:
+                    reason = repr(error)
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    if reason is not None:
+                        for rid in pending:
+                            self.failed_loads[rid] = f"{self._rank_tag}: {reason}"
                     if not replicated:
                         self.completed_loads.put(list(pending))
             finally:
@@ -374,8 +413,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
-    ) -> None:
+    ) -> str | None:
+        """Load every layer of the batch; None when all of it landed.
+
+        Otherwise the reason (the error's repr), recorded per rid by the load
+        thread so the drain can raise with it.
+        """
         started = []
+        reason = None
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
@@ -413,12 +458,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         sizes,
                         offsets,
                     )
-                    expected = [sum(item) for item in sizes]
+                    # The per-key byte list is compared through its total
+                    # first: a get never transfers more than a key's request,
+                    # so an equal total means every key landed in full. This
+                    # thread shares the interpreter with the scheduler; the
+                    # per-page Python list work only runs on a short read.
                     if (
                         result is None
                         or isinstance(result, int)
-                        or list(result) != expected
+                        or sum(result) != sum(map(sum, sizes))
                     ):
+                        expected = [sum(item) for item in sizes]
                         raise RuntimeError(
                             f"Mooncake range get failed for pool={name}, "
                             f"layer={layer}: transferred={result}, "
@@ -426,6 +476,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
+            reason = repr(error)
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
@@ -433,8 +484,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 try:
                     self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
+                    reason = repr(error) if reason is None else reason
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+        if reason is None:
+            self.layer_done_counter.release(counter_index)
+        return reason
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
@@ -480,6 +535,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
+        self.failed_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
         for event, _ in self.broadcast_events:

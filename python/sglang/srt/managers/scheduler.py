@@ -4005,7 +4005,29 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker_load_pending(req.rid)
+            ):
+                # The store->device load of this request's prefix tail is in
+                # flight; admit the requests behind it rather than a batch
+                # whose forward would wait for the load. Checked before the
+                # match, which saves the walk and the store probe for a
+                # request this pass will not admit, and again right after it.
+                continue
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker_load_pending(req.rid)
+            ):
+                # The match just made found a store hit and started its load
+                # (early load): the same skip, so this pass does not admit a
+                # request whose forward would wait on that load. Nothing to
+                # undo: the linker refuses Mamba tree components at init, so
+                # the match staged no state slot or COW/clear metadata, and
+                # the prefix fields init_next_round_input published are
+                # recomputed by the next pass's walk.
+                continue
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4069,6 +4091,12 @@ class Scheduler(
             for req in can_run_list:
                 retries.cancel(req.rid)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if self.enable_unified_cache_external_linker:
+            # Every admitted request holds its own lock on its prefix now
+            # (PrefillAdder._commit_prefill_admission), so the pin that kept
+            # its early-loaded store tail resident while it waited is dropped.
+            for req in can_run_list:
+                self.tree_cache.linker_on_admitted(req.rid)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -4099,10 +4127,17 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
+        if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
+            )
+        elif self.enable_unified_cache_external_linker:
+            # Start the loads queued at admission, but let the forward wait
+            # only on loads whose device slots this batch reads.
+            started_index = self.tree_cache.ready_to_load_host_cache()
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.linker_dependent_load_index(can_run_list, started_index)
             )
 
         new_batch.prepare_for_extend()

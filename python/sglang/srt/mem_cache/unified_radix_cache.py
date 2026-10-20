@@ -3449,18 +3449,61 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
-                dtype=torch.int,
-                device="cpu",
+            # When admission waits for a request's store load to land, every
+            # PP rank must release the same loads in the same iteration: TP-MIN
+            # on PP0, PP0's count down the pipe, later ranks wait for their copy
+            # of each batch (loads are queued in the same order on all ranks).
+            # Otherwise each PP rank drains its own completions as before.
+            lockstep = self.linker.pp_lockstep_drain
+            if lockstep:
+                # Reap the previous round's PP-sync sends before issuing new ones.
+                self._drain_async_work()
+                # Piggybacked rank check on the per-step collective: the
+                # early-load state every rank must agree on (started loads,
+                # fallbacks, started loads not yet drained -- sampled at this
+                # same point of the iteration on every rank), as [x, -x] so
+                # the one MIN gives [min, -max] (the loading_check digest
+                # precedent; the tensor shape is fixed, so every rank enters
+                # the same collective). A mismatch is a rank-local fallback
+                # that diverged one rank's admission. It is detected at the
+                # NEXT step's collective, i.e. after the divergent batch was
+                # formed (and, in a non-overlapped loop, run): the forward of
+                # that batch may already have raised a shape error -- this
+                # check is what names the rank and the cause, before the
+                # drain acts on the count.
+                local = self.linker.early_load_sync_counters()
+                sync_tensor = torch.tensor(
+                    [self.linker.num_completed_loads(), *local, *(-v for v in local)],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+                values = sync_tensor.tolist()
+                tp_rank = (
+                    torch.distributed.get_rank(group=self.tp_group)
+                    if self.tp_group is not None and self.tp_world_size > 1
+                    else 0
+                )
+                self.linker.check_early_load_sync(
+                    values[1:4], [-v for v in values[4:7]], tp_rank=tp_rank
+                )
+                load_count = int(values[0])
+            else:
+                load_count_tensor = torch.tensor(
+                    [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
+                )
+                self._all_reduce_attn_groups(
+                    load_count_tensor, torch.distributed.ReduceOp.MIN
+                )
+                load_count = int(load_count_tensor.item())
+            offload_count = torch.tensor(
+                [self.linker.num_completed_offloads()], dtype=torch.int, device="cpu"
             )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
-            local_successes = self.linker.take_completed_offloads(offload_count)
+            self._all_reduce_attn_groups(offload_count, torch.distributed.ReduceOp.MIN)
+            self.linker.drain_loads(load_count, block=lockstep and self.pp_rank > 0)
+            local_successes = self.linker.take_completed_offloads(
+                int(offload_count.item())
+            )
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
                 self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
@@ -3521,6 +3564,24 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def linker_load_pending(self, rid: str) -> bool:
+        """Whether the external linker is still loading this request's prefix tail."""
+        return self.linker is not None and self.linker.load_pending(rid)
+
+    def linker_on_admitted(self, rid: str) -> None:
+        """The request entered a prefill batch: the linker drops its early-load pin."""
+        if self.linker is not None:
+            self.linker.on_admitted(rid)
+
+    def linker_dependent_load_index(self, reqs, started_index: int) -> int:
+        """Layer-counter index a prefill batch of ``reqs`` must wait on, or -1.
+
+        ``started_index`` is this pass's ``ready_to_load_host_cache`` result.
+        """
+        if self.linker is None:
+            return started_index
+        return self.linker.dependent_load_index(reqs, started_index)
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
