@@ -58,8 +58,7 @@ SGLANG_UNIFIED_LINKER_EARLY_LOAD=0   # keep the memo/gate/lockstep machinery, lo
   (50) or when a pass that reached it admitted nothing without being token-starved; `held`/`hold_expired` are part of the
   per-step rank check and the log line.
 
-Not yet run on hardware: the raw-binding micro-benchmark (coalesced vs per-layer, threads) fixes the group/worker constants
-first; the pybind client's thread-safety and GIL release during gets are assumed and must be confirmed (py-spy `--gil`).
+Raw-binding micro-benchmark (2026-10-21, one H20 node, master + 64 GiB provider, 150k-token rank share): per-layer range get 7.6 ms for 2,344 ranges (1.56 M tok/s per rank over 10 calls), one call for all layers 60–66 ms (2.5 M tok/s), three threads on one client scale 2.4–3× (the binding releases the GIL and is safe from several threads), per-call latency linear in ranges (≈3.3 µs per range). The constants above are confirmed. Not yet run on the fleet: there the loader's cost is Python-side (GIL hand-offs with the scheduler around every call), which the coalesced gets remove ten-fold and the instrumentation measures.
 
 ## Knobs (module constants in `unified_cache_linker.py` / `mooncake_direct_linker.py`; deliberately not flags)
 
