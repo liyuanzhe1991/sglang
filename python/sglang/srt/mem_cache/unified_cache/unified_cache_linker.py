@@ -23,7 +23,10 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import queue
+import threading
 import time
+import zlib
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Sequence
@@ -85,7 +88,10 @@ _LOOKUP_MEMO_MAX_REUSE = 16
 # lease at lookup is 10 s and its eviction is oldest-first over
 # ~90 min of writes, so 30 s keeps the lookup -> load window far from the
 # eviction frontier while costing at most one probe per 30 s per reached
-# request.
+# request. Since v6 it also bounds how long a probe deferred to the
+# background worker may wait for its agreed answer: past it the request
+# is reached again and probed synchronously, so a hung worker costs one
+# bound of latency, never a stuck request.
 _LOOKUP_MEMO_MAX_AGE_PASSES = 300
 # Loads started by ``match`` (before admission) whose DMA may be in flight
 # per rank: queued or executing in the backend's load workers, until the
@@ -182,6 +188,10 @@ _PROBE_TRIGGERS = ("new", "refresh", "age", "shrink", "grow")
 _EARLY_LOAD_START = "start"
 # A PP rank after the first waits at most this long for its copy of a load
 # batch PP0 reported complete; longer means the ranks' load queues diverged.
+# Since v6 the same bound caps a PP rank's wait for its own background
+# probe answer behind PP0's frontier (then the rank distrusts its worker
+# and probes synchronously) and the worker join at close; the report
+# interval below paces the progress line of that wait as well.
 _DRAIN_BLOCK_TIMEOUT_S = 60.0
 # While it waits, a progress line every this many seconds.
 _DRAIN_REPORT_INTERVAL_S = 5.0
@@ -493,6 +503,88 @@ class _EarlyPin(NamedTuple):
     tokens: int
 
 
+class _ProbeTask(NamedTuple):
+    """A store probe ``match`` handed to the background worker instead of running it.
+
+    Everything the probe needs that only the scheduler thread may read is
+    taken at submission: the anchor hash of the last device page
+    (``last_hash``, the one tree read) and the tail's bounds in the walk's
+    key. The key is held by reference, not copied: its token array is the
+    request's input ids, which the scheduler does not grow while the request
+    waits. ``seq`` and ``generation`` let a late answer be matched to exactly
+    this submission, or dropped.
+    """
+
+    seq: int
+    generation: int
+    rid: str
+    key: RadixKey
+    # The tail is ``key[start:stop]``: ``start`` is the device-cached prefix
+    # length, ``stop - start`` the page-aligned tail length.
+    start: int
+    stop: int
+    last_hash: str | None
+    # The scheduler pass the probe was submitted in: the memo's probe pass,
+    # so the age bound counts from the lookup as for a synchronous probe.
+    pass_no: int
+
+
+class _ProbeAnswer(NamedTuple):
+    """What the worker found for one ``_ProbeTask``; rank-local until agreed."""
+
+    seq: int
+    rid: str
+    generation: int
+    restorable: list[int]
+    tail_hashes: list[str]
+    swa_keys: int
+    has_mamba: bool
+    # A component declined the LOOKUP (built no transfer): the request is
+    # left as a synchronous probe leaves it -- no memo, reached again.
+    no_probe: bool
+    hash_s: float
+    rpc_s: float
+    # ``repr`` of the exception the probe raised, if any; the consumer then
+    # probes synchronously for the entry.
+    error: str | None
+
+
+def _probe_error_answer(task: _ProbeTask, exc: BaseException) -> _ProbeAnswer:
+    """The answer a probe that raised publishes, so its entry is never waited on."""
+    return _ProbeAnswer(
+        seq=task.seq,
+        rid=task.rid,
+        generation=task.generation,
+        restorable=[],
+        tail_hashes=[],
+        swa_keys=-1,
+        has_mamba=False,
+        no_probe=False,
+        hash_s=0.0,
+        rpc_s=0.0,
+        error=repr(exc),
+    )
+
+
+@dataclass
+class _PendingProbe:
+    """A deferred probe between its submission and its agreed consumption.
+
+    The task, the memo inputs the submission saw, the tail's page count and
+    the trigger are identical on every PP rank (the deferral set's
+    invariant); ``answer`` is this rank's own, filed by the step-start
+    drain, and decides nothing by itself: it feeds PP0's frontier value and
+    the restorable list that enters the agreed mask collective.
+    """
+
+    task: _ProbeTask
+    key_len: int
+    device_hit_len: int
+    pages: int
+    trigger: str
+    answer: _ProbeAnswer | None = None
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -593,12 +685,77 @@ class UnifiedCacheLinkerWrapper:
         self._probe_recent: deque[float] = deque(maxlen=_PROBE_LATENCY_WINDOW)
         self._probe_sync_s = 0.0
         self._probe_sync_max_s = 0.0
+        # Synchronous probes on which this rank issued no store RPC: under
+        # the lockstep drain a PP rank after the first takes PP0's answer
+        # from the mask collective (``match``), so its own lookup would only
+        # have fed the skew diagnostic. The RPC fields above describe RPCs
+        # actually issued.
+        self._probe_pp_skipped = 0
         # Device KV a hit refused under the pinned cap in this pass would
         # pin (its tail plus its device prefix): later starts of the same
         # pass are judged with it added to the pinned total, so the room an
         # admission frees reaches the earliest held request and smaller hits
         # behind it cannot leapfrog it indefinitely. Reset by ``on_pass_end``.
         self._pin_reserved_tokens = 0
+        # v6: store probes taken off the scheduler thread. Every probe after
+        # a pass's first, for a request that is not held, is handed to one
+        # background worker per rank; the request stays out of admission
+        # through ``load_pending`` until its answer is consumed at a later
+        # step behind a ready frontier PP0 publishes on the per-step
+        # collective, so no rank branches on its own worker's state.
+        # ``_probe_pending`` (rid -> entry, insertion-ordered) is identical
+        # on every PP rank: entries are added only by ``match``'s
+        # rank-consistent deferral rule and removed only by the agreed
+        # consumption, ``on_admitted``, ``release_request``, ``reset`` or
+        # the pass-bound expiry in ``match``; a crc of its rids rides on the
+        # per-step rank check. The answers filed in it, the worker's
+        # liveness and ``_probe_distrusted`` are rank-local.
+        self._probe_tasks: queue.Queue[_ProbeTask | None] = queue.Queue()
+        self._probe_results: queue.Queue[_ProbeAnswer] = queue.Queue()
+        self._probe_seq = 0
+        # Bumped by ``reset``: an answer of an older generation is dropped.
+        self._probe_generation = 0
+        # This rank once waited the drain's bound for its own answer: from
+        # then on every missing answer is probed synchronously at once.
+        self._probe_distrusted = False
+        self._probe_worker_dead_warned = False
+        self._probe_pending: dict[str, _PendingProbe] = {}
+        # Deferrals of the pass in progress (with ``_pass_probes`` the input
+        # of the first-probe rule) and of the last closed pass; totals by
+        # outcome; wait lengths and the worker's wall times.
+        self._pass_submits = 0
+        self._last_pass_submits = 0
+        self._bg_submitted = 0
+        self._bg_consumed = 0
+        self._bg_sync_first = 0
+        self._bg_sync_held = 0
+        self._bg_fallback = 0
+        self._bg_expired = 0
+        self._bg_stale = 0
+        self._bg_wait_passes = 0
+        self._bg_wait_max = 0
+        self._bg_answered = 0
+        self._bg_hash_s = 0.0
+        self._bg_hash_max_s = 0.0
+        self._bg_rpc_s = 0.0
+        self._bg_rpc_max_s = 0.0
+        self._bg_rpc_recent: deque[float] = deque(maxlen=_PROBE_LATENCY_WINDOW)
+        # Scheduler-thread wall time by phase of the iteration over the
+        # window since the last periodic line (``_report`` resets it): the
+        # step-sync and drain phase (``events``, with the agreed consumption
+        # ``consume`` inside it), the admission walk (``walk``, with the
+        # early loads' ``evict`` / ``load_back`` and the synchronous probes
+        # inside it) and the rest of the iteration, from a pass end to the
+        # next step's first linker call, classified by what the pass
+        # admitted (``outside_none`` / ``outside_cold`` / ``outside_hit``).
+        # Counts are rank-identical, wall sums per rank.
+        self._reset_timing_window(time.monotonic())
+        self._step_open = False
+        self._iter_start: float | None = None
+        self._events_end: float | None = None
+        self._last_pass_end: float | None = None
+        self._prev_admitted = 0
+        self._prev_admitted_hit = False
         allocator = cache.token_to_kv_pool_allocator
         pool_size = getattr(allocator, "size_full", None)
         if pool_size is None:
@@ -651,15 +808,20 @@ class UnifiedCacheLinkerWrapper:
                 cache.pp_size,
             )
             self._track_dependencies = False
+        # v6: the background probe worker exists only while dependencies are
+        # tracked (``_start_probe_worker``); without it ``match`` keeps the
+        # synchronous probe path unchanged.
+        self._probe_worker = self._start_probe_worker()
         logger.info(
             "External cache linker: early_load=%s dependency_tracking=%s "
-            "pp_size=%s pp_group=%s pinned_cap=%d headroom=%d",
+            "pp_size=%s pp_group=%s pinned_cap=%d headroom=%d probe_worker=%s",
             self._early_load,
             self._track_dependencies,
             cache.pp_size,
             cache.pp_group is not None,
             self._early_pinned_cap,
             self._early_load_headroom,
+            self._probe_worker is not None,
         )
 
         cache.tree_core.enable_external_cache_linker = True
@@ -723,6 +885,52 @@ class UnifiedCacheLinkerWrapper:
                 trigger = "refresh"
             else:
                 trigger = "age"
+            pending = self._probe_pending.get(req.rid)
+            if pending is not None:
+                # Reached with a probe still pending: ``load_pending`` stopped
+                # deferring it because the probe is older than
+                # ``_LOOKUP_MEMO_MAX_AGE_PASSES`` (a hung PP0 worker, or a
+                # frontier that never reached it). The synchronous path
+                # below answers now; the late answer, if any, is stale.
+                del self._probe_pending[req.rid]
+                self._bg_expired += 1
+                self._log_probe_expiry(
+                    req.rid, self._pass_counter - pending.task.pass_no
+                )
+            elif (
+                self._probe_worker is not None
+                # A held hit's refresh books the pass's head-of-line
+                # reservation in the verdict below, so it stays synchronous.
+                and req.rid not in self._held
+                # Not the first probe this pass needs: the head of the walk
+                # is answered now, every later arrival of the pass waits a
+                # step. Both counters advance only through this method, so
+                # the rule reads the same on every PP rank.
+                and (self._pass_probes + self._pass_submits) > 0
+            ):
+                # Deferred: the anchor is the only tree read and is taken
+                # here; the worker hashes the tail and asks the store. The
+                # request returns device-only with no memo and no marker,
+                # and ``load_pending`` keeps it out of admission until the
+                # answer is agreed. The two early returns are the outcomes
+                # ``_tail_hashes`` has for the synchronous path.
+                last_hash = None
+                if device_hit_len > 0:
+                    last_hash = cache.get_last_hash_value(result.last_device_node)
+                    if last_hash is None:
+                        return result
+                tail_len = (len(key) - device_hit_len) // page * page
+                if tail_len == 0:
+                    return result
+                self._defer_probe(
+                    req.rid, key, device_hit_len, tail_len, last_hash, trigger
+                )
+                return result
+            elif self._probe_worker is not None:
+                if req.rid in self._held:
+                    self._bg_sync_held += 1
+                else:
+                    self._bg_sync_first += 1
             hash_start = time.monotonic()
             tail_hashes = self._tail_hashes(key, result, device_hit_len)
             if not tail_hashes:
@@ -739,18 +947,31 @@ class UnifiedCacheLinkerWrapper:
             by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
             # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+            # Under the lockstep drain the answer is PP0's whatever this rank
+            # sends into the collective (``_sync_restorable_prefix``), so a PP
+            # rank after the first does not ask its store on this path: an
+            # empty mask of the same shape (the tail hashed here) goes in and
+            # PP0's comes back. Only the worker's probes keep their RPC on
+            # every rank, off this thread.
+            lookup_skipped = (
+                self.pp_lockstep_drain and getattr(cache, "pp_rank", 0) > 0
+            )
             probe_start = time.monotonic()
-            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+            if lookup_skipped:
+                restorable: list[int] = []
+            else:
+                restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
             probe_end = time.monotonic()
             hit_pages = self._sync_restorable_prefix(
                 restorable,
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
+                lookup_skipped=lookup_skipped,
             )
             self._note_probe(
                 trigger,
                 probe_start - hash_start,
-                probe_end - probe_start,
+                None if lookup_skipped else probe_end - probe_start,
                 time.monotonic() - probe_end,
             )
             swa_transfer = by_pool.get(PoolName.SWA)
@@ -855,7 +1076,12 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        lookup_skipped: bool = False,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -871,7 +1097,11 @@ class UnifiedCacheLinkerWrapper:
         page PP0 holds then fails that load in ``load_layer_wise`` and the
         drain raises naming the rank, instead of the ranks admitting
         differently. Otherwise the intersection stays over the attention
-        groups alone, as before.
+        groups alone, as before. ``lookup_skipped`` says this rank did not
+        ask its store for this probe (a PP rank after the first on the
+        walk's synchronous path, whose answer is PP0's regardless): its
+        ``restorable`` is empty by construction and the skew diagnostic
+        below has no local answer to compare, so it is not run.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
         lengths = [
@@ -887,13 +1117,58 @@ class UnifiedCacheLinkerWrapper:
         if common.numel() == 0:
             return 0
         agreed = int(common[-1].item())
-        if self.pp_lockstep_drain and agreed not in lengths:
+        if self.pp_lockstep_drain and not lookup_skipped and agreed not in lengths:
             # PP0's answer names pages this rank's own store cannot restore
             # (per-rank namespaces, eviction skew between them -- the steady
             # state at store capacity). The load of this hit will fail on this
             # rank alone; the line says why before the drain raises.
             self._log_hit_length_skew(agreed, max(lengths, default=0))
         return agreed
+
+    def _sync_restorable_prefixes(
+        self, items: Sequence[tuple[Sequence[int], int]]
+    ) -> list[int]:
+        """``_sync_restorable_prefix`` for every deferred probe agreed this
+        step, in one collective.
+
+        ``items`` are ``(restorable, pages)`` per consumed entry in
+        ``_probe_pending`` order. The per-entry masks (``pages + 1`` slots
+        each, index 0 never set) are laid end to end in one tensor, reduced
+        once through ``_all_reduce`` -- the worker exists only under the
+        lockstep drain, so the answer is PP0's as for the walk's probes --
+        and split back. Every rank consumes the same entries in the same
+        order with the same page counts, so the tensor length is equal on
+        every rank and the PP send and receive sizes match. The skew warning
+        is per entry, as for a single probe.
+        """
+        mask = torch.zeros(sum(pages + 1 for _, pages in items), dtype=torch.int)
+        local: list[list[int]] = []
+        offset = 0
+        for restorable, pages in items:
+            lengths = [n for n in restorable if 0 < n <= pages]
+            if lengths:
+                mask[torch.tensor([offset + n for n in lengths], dtype=torch.int64)] = 1
+            local.append(lengths)
+            offset += pages + 1
+        self.cache._all_reduce(mask, torch.distributed.ReduceOp.MIN)
+        # One nonzero over the whole tensor, walked once: the hit indices
+        # come back ascending, so each entry's agreed length is the last
+        # index inside its slot range.
+        hits = mask.nonzero().flatten().tolist()
+        agreed_all: list[int] = []
+        offset = 0
+        position = 0
+        for (_, pages), lengths in zip(items, local):
+            end = offset + pages + 1
+            agreed = 0
+            while position < len(hits) and hits[position] < end:
+                agreed = hits[position] - offset
+                position += 1
+            if agreed and agreed not in lengths:
+                self._log_hit_length_skew(agreed, max(lengths, default=0))
+            agreed_all.append(agreed)
+            offset = end
+        return agreed_all
 
     def _log_hit_length_skew(self, agreed_pages: int, local_pages: int) -> None:
         """A PP0-agreed hit length beyond this rank's store: WARNING three times, then every hundredth.
@@ -936,6 +1211,146 @@ class UnifiedCacheLinkerWrapper:
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
+        )
+
+    # ---- v6: the background probe worker ----
+
+    def _start_probe_worker(self) -> threading.Thread | None:
+        """Start this rank's background probe worker, or none.
+
+        Only while dependencies are tracked: the frontier the ranks consume
+        deferred answers behind rides on the lockstep per-step collective,
+        which exists only then (the same gate as the holds); otherwise
+        ``match`` keeps the synchronous probe path unchanged. One thread, so
+        answers come back in submission order and PP0's frontier is a prefix
+        count over ``_probe_pending``.
+        """
+        if not self._track_dependencies:
+            return None
+        worker = threading.Thread(
+            target=self._probe_worker_func,
+            daemon=True,
+            name=f"linker-probe-pp{getattr(self.cache, 'pp_rank', 0)}",
+        )
+        worker.start()
+        return worker
+
+    def _probe_worker_func(self) -> None:
+        """Run deferred probes until the ``None`` sentinel, publishing every answer."""
+        while True:
+            task = self._probe_tasks.get()
+            if task is None:
+                return
+            self._probe_results.put(self._probe_one(task))
+
+    def _probe_one(self, task: _ProbeTask) -> _ProbeAnswer:
+        """Run one deferred probe on the worker without letting an
+        ``Exception`` end the thread.
+
+        An RPC or hashing failure becomes an answer carrying ``error``: it
+        counts toward the frontier, so one rank's failure stalls nobody, and
+        the consumer probes synchronously for the entry. A ``BaseException``
+        (a pyo3 panic poisons the binding) is logged, answered the same way
+        so the entry is not waited on, and re-raised: the thread ends and
+        every pending entry is consumed through the synchronous fallback.
+        """
+        try:
+            return self._probe_body(task)
+        except Exception as exc:
+            return _probe_error_answer(task, exc)
+        except BaseException as exc:
+            logger.error(
+                "External cache linker: probe worker on pp_rank=%s ends on %r "
+                "(rid=%s); deferred probes run synchronously from the next step",
+                getattr(self.cache, "pp_rank", 0),
+                exc,
+                task.rid,
+            )
+            self._probe_results.put(_probe_error_answer(task, exc))
+            raise
+
+    def _probe_body(self, task: _ProbeTask) -> _ProbeAnswer:
+        """The probe itself, with no tree access: hash the tail from its
+        anchor, build the LOOKUP transfers, one store RPC.
+
+        What ``match`` does synchronously between its hash start and the
+        store's answer (``_tail_hashes`` without its tree read, the transfer
+        build, ``cache_linker.lookup``), reading from the cache only its page
+        size, so it runs on the worker thread -- the native hash releases the
+        GIL and the store client already serves the load workers
+        concurrently -- and on the scheduler thread as the fallback for an
+        entry without a usable answer, where it raises as ``match`` would.
+        """
+        hash_start = time.monotonic()
+        tail_hashes = get_storage_hash_str(
+            task.key[task.start : task.stop],
+            task.last_hash,
+            page_size=self.cache.page_size,
+        )
+        lookup_transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                return _ProbeAnswer(
+                    seq=task.seq,
+                    rid=task.rid,
+                    generation=task.generation,
+                    restorable=[],
+                    tail_hashes=list(tail_hashes),
+                    swa_keys=-1,
+                    has_mamba=False,
+                    no_probe=True,
+                    hash_s=time.monotonic() - hash_start,
+                    rpc_s=0.0,
+                    error=None,
+                )
+            lookup_transfers.append(transfer)
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+        probe_start = time.monotonic()
+        restorable = self.cache_linker.lookup(task.rid, lookup_transfers)
+        probe_end = time.monotonic()
+        swa_transfer = by_pool.get(PoolName.SWA)
+        return _ProbeAnswer(
+            seq=task.seq,
+            rid=task.rid,
+            generation=task.generation,
+            restorable=list(restorable),
+            tail_hashes=list(tail_hashes),
+            swa_keys=len(swa_transfer.keys) if swa_transfer is not None else -1,
+            has_mamba=PoolName.MAMBA in by_pool,
+            no_probe=False,
+            hash_s=probe_start - hash_start,
+            rpc_s=probe_end - probe_start,
+            error=None,
+        )
+
+    def _worker_alive(self) -> bool:
+        return self._probe_worker is not None and self._probe_worker.is_alive()
+
+    def _log_probe_expiry(self, rid: str, waited: int) -> None:
+        """A deferred probe not agreed within the memo age bound: WARNING
+        three times, then every hundredth.
+
+        On PP0 it means its worker made no progress (alive, no answer); on a
+        later rank only that PP0's frontier never reached the entry. The
+        request is probed synchronously now, so the cost is one bound of
+        latency, never a wrong answer.
+        """
+        if self._bg_expired > 3 and self._bg_expired % 100:
+            return
+        logger.warning(
+            "External cache linker: deferred probe of rid=%s expired after %d "
+            "passes on pp_rank=%s (%d so far); probing synchronously "
+            "(worker_alive=%s worker_queue=%d pending=%d)",
+            rid,
+            waited,
+            getattr(self.cache, "pp_rank", 0),
+            self._bg_expired,
+            self._worker_alive(),
+            self._probe_tasks.qsize(),
+            len(self._probe_pending),
         )
 
     def _decide_early_load(
@@ -1085,7 +1500,17 @@ class UnifiedCacheLinkerWrapper:
         rule reads is the same on every rank: ``_held_this_pass`` is filled
         by this pass's ``match`` calls from the verdict's inputs,
         ``admitted`` and ``starved`` come from the deterministic admission
-        walk.
+        walk. Since v6 the hook also closes the pass's deferrals, books the
+        walk's wall time, stamps the pass end for the next step's outside
+        interval and prints the periodic lines when a minute passed without
+        a decision. A deferred request is not in ``_held_this_pass`` and
+        books no reservation, and the idle rule fires only on a pass that
+        deferred nothing (``_last_pass_submits == 0``): a deferred store
+        miss would have been admitted cold had it been probed synchronously,
+        so a pass with deferrals is no evidence that the holds idled it; the
+        expiry waits the one-to-few passes until the deferred entries are
+        consumed and reached. The submissions advance only through
+        ``match``'s deferral rule, so the gate reads the same on every rank.
         """
         self._pass_counter += 1
         self._last_pass_probes, self._pass_probes = self._pass_probes, 0
@@ -1093,6 +1518,20 @@ class UnifiedCacheLinkerWrapper:
         self._pin_reserved_tokens = 0
         reached = set(self._held_this_pass)
         self._held_this_pass.clear()
+        self._last_pass_submits, self._pass_submits = self._pass_submits, 0
+        now = time.monotonic()
+        walk_start = (
+            self._events_end if self._events_end is not None else self._iter_start
+        )
+        if walk_start is not None:
+            self._note_time("walk", now - walk_start)
+        self._last_pass_end = now
+        self._prev_admitted = admitted
+        # ``on_admitted`` runs after this hook and sets it for a pinned hit.
+        self._prev_admitted_hit = False
+        self._timing_passes += 1
+        if now - self._early_load_last_report >= _EARLY_LOAD_REPORT_INTERVAL_S:
+            self._report(now)
         if not self._held:
             return
         expired = []
@@ -1100,7 +1539,15 @@ class UnifiedCacheLinkerWrapper:
             self._held[rid] += 1
             if self._held[rid] > _EARLY_LOAD_HOLD_MAX_PASSES:
                 expired.append(rid)
-        idle = admitted == 0 and reached and not starved
+        idle = (
+            admitted == 0
+            and reached
+            and not starved
+            # v6: a pass that deferred probes left candidates undecided; a
+            # store miss among them would have been admitted cold and kept
+            # the hold, so the pass is no evidence against the holds.
+            and self._last_pass_submits == 0
+        )
         if idle and not expired:
             # The oldest hold among those the walk reached and skipped this
             # pass. A reached hold is always still held (every removal from
@@ -1115,19 +1562,60 @@ class UnifiedCacheLinkerWrapper:
             self._record_early_load_decision(_EARLY_LOAD_HOLD_EXPIRED)
 
     def _note_probe(
-        self, trigger: str, hash_s: float, rpc_s: float, sync_s: float
+        self, trigger: str, hash_s: float, rpc_s: float | None, sync_s: float
     ) -> None:
-        """Book one store probe: why it ran and its three wall times."""
+        """Book one store probe: why it ran and its three wall times.
+
+        ``rpc_s`` is None when this rank issued no store RPC for the probe
+        (a PP rank after the first under the lockstep drain, which takes
+        PP0's answer): the probe is counted -- ``_pass_probes`` feeds the
+        deferral rule and must advance alike on every rank -- its hashing
+        and sync times are booked, the RPC fields are left to the RPCs
+        actually issued, and ``_probe_pp_skipped`` advances.
+        """
         self._pass_probes += 1
         self._probe_count += 1
         self._probe_triggers[trigger] += 1
         self._probe_hash_s += hash_s
         self._probe_hash_max_s = max(self._probe_hash_max_s, hash_s)
-        self._probe_s += rpc_s
-        self._probe_max_s = max(self._probe_max_s, rpc_s)
-        self._probe_recent.append(rpc_s)
+        if rpc_s is None:
+            self._probe_pp_skipped += 1
+            rpc_s = 0.0
+        else:
+            self._probe_s += rpc_s
+            self._probe_max_s = max(self._probe_max_s, rpc_s)
+            self._probe_recent.append(rpc_s)
         self._probe_sync_s += sync_s
         self._probe_sync_max_s = max(self._probe_sync_max_s, sync_s)
+        self._note_time("sync_probe", hash_s + rpc_s + sync_s)
+
+    def _note_time(self, bucket: str, seconds: float, count: int = 1) -> None:
+        """Book one interval of scheduler-thread time under ``bucket`` (sum, max, count)."""
+        entry = self._timing[bucket]
+        entry[0] += seconds
+        if seconds > entry[1]:
+            entry[1] = seconds
+        entry[2] += count
+
+    def _reset_timing_window(self, now: float) -> None:
+        """Zero the step-timing window the periodic line prints (per bucket: sum s, max s, count)."""
+        self._timing: dict[str, list] = {
+            name: [0.0, 0.0, 0]
+            for name in (
+                "events",
+                "consume",
+                "walk",
+                "outside_none",
+                "outside_cold",
+                "outside_hit",
+                "evict",
+                "load_back",
+                "sync_probe",
+            )
+        }
+        self._evict_tokens = 0
+        self._timing_passes = 0
+        self._window_start = now
 
     def _log_early_load_failure(self, rid: str, what: str) -> None:
         """Count a raising early-load attempt; log it three times, then every hundredth."""
@@ -1207,7 +1695,10 @@ class UnifiedCacheLinkerWrapper:
             try:
                 available = cache._component_available_size(ComponentType.FULL)
                 if available < needed:
+                    evict_start = time.monotonic()
                     cache.evict_for_alloc(EvictParams(num_tokens=needed - available))
+                    self._note_time("evict", time.monotonic() - evict_start)
+                    self._evict_tokens += needed - available
                     self._early_load_stats[_EARLY_LOAD_EVICTED_FOR] += 1
             except Exception:
                 # Nothing allocated or inserted yet: load at admission.
@@ -1216,7 +1707,9 @@ class UnifiedCacheLinkerWrapper:
                 )
                 self.hit_markers[req.rid] = marker
                 return _EARLY_LOAD_FELL_BACK
+            load_start = time.monotonic()
             indices, _ = self.load_back(req)
+            self._note_time("load_back", time.monotonic() - load_start)
         finally:
             cache.dec_lock_ref(anchor, lock_params)
         if indices.numel() == 0:
@@ -1294,38 +1787,173 @@ class UnifiedCacheLinkerWrapper:
         Called by the scheduler once the admitted requests have left the
         waiting queue; each of them holds its own lock on its prefix by then
         (``PrefillAdder._commit_prefill_admission``), so dropping the pin
-        cannot expose the tail. The request's booked verdict goes with it.
+        cannot expose the tail. The request's booked verdict goes with it,
+        and so does a deferred probe still pending for it (v6).
         """
+        if rid in self._early_pinned:
+            # The pass that just ended admitted an early-loaded hit: the
+            # next step's outside interval is booked as ``outside_hit``.
+            self._prev_admitted_hit = True
         self._release_early_pin(rid)
         self._last_verdicts.pop(rid, None)
         self._forget_hold(rid)
+        self._probe_pending.pop(rid, None)
 
     def _forget_hold(self, rid: str) -> None:
         self._held.pop(rid, None)
         self._held_this_pass.discard(rid)
         self._hold_spent.discard(rid)
 
+    def _begin_step(self) -> None:
+        """The first linker call of a scheduler step: stamp it, book the
+        interval since the last pass end, file the worker's answers.
+
+        ``early_load_sync_counters`` is called twice per step (the cache's
+        sample, then the check's own re-read), so this runs once behind
+        ``_step_open``, which ``drain_loads`` clears at the end of the step.
+        The interval since ``on_pass_end`` is classified by what that pass
+        admitted: nothing (no forward ran: bootstrap poll, ingest, spin),
+        cold requests only, or a request whose early-loaded hit
+        ``on_admitted`` found pinned. The stamp is used once; an iteration
+        with a step but no walk (an empty queue, a full batch) admitted
+        nothing, so what followed its drain is booked as ``outside_none``
+        from the drain's end -- every interval between two linker calls
+        lands in exactly one bucket, none twice.
+        """
+        if self._step_open:
+            return
+        self._step_open = True
+        now = time.monotonic()
+        self._iter_start = now
+        if self._last_pass_end is not None:
+            if self._prev_admitted_hit:
+                bucket = "outside_hit"
+            elif self._prev_admitted > 0:
+                bucket = "outside_cold"
+            else:
+                bucket = "outside_none"
+            self._note_time(bucket, now - self._last_pass_end)
+            self._last_pass_end = None
+        elif self._events_end is not None:
+            self._note_time("outside_none", now - self._events_end)
+        self._events_end = None
+        self._drain_probe_results()
+
+    def _drain_probe_results(self) -> None:
+        """File every answer the worker published; a dead worker's queued
+        tasks are dropped.
+
+        The tasks hold references to whole token arrays, so a worker that
+        ended must not keep them queued; the entries stay pending and are
+        probed synchronously at consumption (PP0's frontier reports every
+        pending entry while its worker is dead, so the ranks consume them at
+        once). One WARNING names the rank.
+        """
+        while True:
+            try:
+                answer = self._probe_results.get_nowait()
+            except queue.Empty:
+                break
+            self._file_probe_answer(answer)
+        if self._probe_worker is None or self._worker_alive():
+            return
+        dropped = 0
+        while True:
+            try:
+                self._probe_tasks.get_nowait()
+            except queue.Empty:
+                break
+            dropped += 1
+        if not self._probe_worker_dead_warned:
+            self._probe_worker_dead_warned = True
+            logger.warning(
+                "External cache linker: probe worker is not alive on pp_rank=%s; "
+                "%d queued probes dropped, the %d pending entries and every later "
+                "deferral are probed synchronously at consumption",
+                getattr(self.cache, "pp_rank", 0),
+                dropped,
+                len(self._probe_pending),
+            )
+
+    def _file_probe_answer(self, answer: _ProbeAnswer) -> None:
+        """Attach an answer to its pending entry, or drop it as stale.
+
+        Stale: the entry is gone (admitted, released, expired, consumed
+        through a fallback), the generation moved on (``reset``) or the rid
+        was re-submitted under a new ``seq``.
+        """
+        pending = self._probe_pending.get(answer.rid)
+        if (
+            pending is None
+            or answer.generation != self._probe_generation
+            or pending.task.seq != answer.seq
+        ):
+            self._bg_stale += 1
+            return
+        pending.answer = answer
+        if answer.error is None and not answer.no_probe:
+            self._bg_answered += 1
+            self._bg_hash_s += answer.hash_s
+            self._bg_hash_max_s = max(self._bg_hash_max_s, answer.hash_s)
+            self._bg_rpc_s += answer.rpc_s
+            self._bg_rpc_max_s = max(self._bg_rpc_max_s, answer.rpc_s)
+            self._bg_rpc_recent.append(answer.rpc_s)
+
+    def _pending_crc(self) -> int:
+        """crc32 of the pending rids in order, 0 when none: the rank check's
+        view of the deferral set, so a membership or order divergence is
+        named at the next step instead of mis-sizing the agreed mask
+        collective."""
+        return zlib.crc32("\n".join(self._probe_pending).encode())
+
+    def _probe_frontier(self) -> int:
+        """How many leading pending entries this rank could consume now.
+
+        Only PP0's value acts: it goes down the pipe on the per-step
+        collective and every rank consumes that many. Rank-local by design
+        and excluded from the equality check: a rank behind PP0 waits for
+        its own answers or probes synchronously. A distrusted or dead worker
+        reports every entry, so the ranks consume them through the fallback
+        at once rather than waiting for answers that will not come.
+        """
+        if self._probe_worker is None:
+            return 0
+        if self._probe_distrusted or not self._worker_alive():
+            return len(self._probe_pending)
+        ready = 0
+        for pending in self._probe_pending.values():
+            if pending.answer is None:
+                break
+            ready += 1
+        return ready
+
     def early_load_sync_counters(self) -> list[int]:
         """The early-load state every rank must agree on, sampled per scheduler step.
 
         ``[started, fell_back, started loads not yet drained, held,
-        hold_expired, passes]``: the decisions that make a rank skip a request at
-        admission (``started``, and the holds of refused hits, ``held``) or
-        admit it with a load at admission (``fell_back``, and an expired
-        hold, ``hold_expired`` -- a one-sided expiry, from an ``admitted``,
-        ``starved`` or age mismatch, would otherwise show only at the next
-        step as a ``started`` divergence, after the divergent batch formed),
-        and the size of the gate (``_load_index``). All five evolve by the
+        hold_expired, passes, pending_crc, frontier]``: the decisions that
+        make a rank skip a request at admission (``started``, and the holds
+        of refused hits, ``held``) or admit it with a load at admission
+        (``fell_back``, and an expired hold, ``hold_expired`` -- a one-sided
+        expiry, from an ``admitted``, ``starved`` or age mismatch, would
+        otherwise show only at the next step as a ``started`` divergence,
+        after the divergent batch formed), the size of the gate
+        (``_load_index``), the memo-age clock, and since v6 a crc of the
+        deferred probes' rids in order. The first seven evolve by the
         deterministic event sequence of the scheduler iteration -- verdicts
-        in ``match``, holds, starts, lockstep drains, pass ends -- so
-        sampled at the same point of the iteration on every
-        rank (``check_hicache_events``) they are equal unless a rank-local
+        in ``match``, holds, starts, lockstep drains, pass ends, deferrals
+        -- so sampled at the same point of the iteration on every rank
+        (``check_hicache_events``) they are equal unless a rank-local
         fallback (a per-rank exception, allocation refusal or under-eviction)
         diverged one rank's decision; ``adopted`` on one rank only shows up
-        as a ``started`` mismatch. The cache reduces them with MIN and MAX on
-        the existing per-step lockstep collective and ``check_early_load_sync``
-        raises on a mismatch.
+        as a ``started`` mismatch. The eighth, this rank's ready frontier
+        over the deferred probes, is rank-local by design: the cache reduces
+        all eight with MIN and MAX on the existing per-step lockstep
+        collective, ``check_early_load_sync`` raises on a mismatch of the
+        first seven and consumes PP0's frontier. The first call of a step
+        also opens it (``_begin_step``).
         """
+        self._begin_step()
         return [
             self._early_load_stats[_EARLY_LOAD_STARTED],
             self._early_load_stats[_EARLY_LOAD_FELL_BACK],
@@ -1336,12 +1964,17 @@ class UnifiedCacheLinkerWrapper:
             # as a mis-paired probe collective (a hang or a shape error) on
             # the pass the ranks re-probe at different times.
             self._pass_counter,
+            # v6: the deferral set, and this rank's frontier over it (the
+            # one entry the check does not compare; PP0's value acts).
+            self._pending_crc(),
+            self._probe_frontier(),
         ]
 
     def check_early_load_sync(
         self, agreed_min: Sequence[int], agreed_max: Sequence[int], *, tp_rank: int = 0
     ) -> None:
-        """Raise when the ranks' early-load state diverged within a scheduler step.
+        """Raise when the ranks' early-load state diverged within a scheduler
+        step; then consume the deferred probes PP0's frontier agreed.
 
         ``agreed_min`` / ``agreed_max`` are PP0's attention-group MIN and MAX
         of ``early_load_sync_counters`` after the PP sync. On PP0 a MIN that
@@ -1351,19 +1984,143 @@ class UnifiedCacheLinkerWrapper:
         refused hit) skips the request at admission while a rank that did not
         admits it, and the batches diverge -- a PP hang the drain timeout sees
         only in one direction and the order check never (the Mooncake backend
-        publishes completions in queue order by construction).
+        publishes completions in queue order by construction). The last entry,
+        the frontier, is not compared: its MIN is PP0's TP-agreed value, and
+        every rank consumes exactly that many pending probes (clipped to the
+        pending count, equal on every rank) here, still inside
+        ``check_hicache_events`` and before the drain, so the batched mask
+        collective is ordered identically on every rank.
         """
         local = self.early_load_sync_counters()
         agreed_min = [int(v) for v in agreed_min]
         agreed_max = [int(v) for v in agreed_max]
-        if local == agreed_min == agreed_max:
+        if not (local[:-1] == agreed_min[:-1] == agreed_max[:-1]):
+            raise RuntimeError(
+                "External cache linker: early-load state diverged across ranks on "
+                f"pp_rank={getattr(self.cache, 'pp_rank', 0)} tp_rank={tp_rank}: "
+                "local [started, fell_back, started_loads, held, hold_expired, "
+                f"passes, pending_crc, frontier]={local}, PP0 "
+                f"min={agreed_min} max={agreed_max}"
+            )
+        self._consume_agreed_probes(min(agreed_min[-1], len(self._probe_pending)))
+
+    def _consume_agreed_probes(self, agreed: int) -> None:
+        """Turn the first ``agreed`` pending probes into memos behind one
+        mask collective.
+
+        ``agreed`` is PP0's frontier clipped to the pending count (equal on
+        every rank), so every rank consumes the same entries in the same
+        order. An entry this rank has no usable answer for is waited on (its
+        worker is behind PP0's) or probed synchronously here
+        (``bg_fallback``): the inputs to the collective may differ per rank,
+        the control flow never does. A fallback probe is not booked by
+        ``_note_probe``: ``_pass_probes`` feeds the deferral rule and must
+        advance only through the walk's ``match`` calls, identically on
+        every rank. The memo carries the submission's key and prefix lengths
+        and its pass, so the age bound counts from the lookup as for a
+        synchronous probe, and the walk reuses it through the memo path with
+        no further change; a ``no_probe`` answer leaves no memo, the outcome
+        a declining component has on the synchronous path.
+        """
+        if agreed <= 0:
             return
-        raise RuntimeError(
-            "External cache linker: early-load state diverged across ranks on "
-            f"pp_rank={getattr(self.cache, 'pp_rank', 0)} tp_rank={tp_rank}: "
-            f"local [started, fell_back, started_loads, held, hold_expired, passes]={local}, PP0 "
-            f"min={agreed_min} max={agreed_max}"
+        start = time.monotonic()
+        entries = list(self._probe_pending.items())[:agreed]
+        answers: list[_ProbeAnswer] = []
+        for _, pending in entries:
+            answer = pending.answer
+            if answer is None and not self._probe_distrusted and self._worker_alive():
+                answer = self._await_probe_answer(pending)
+            if (
+                answer is None
+                or answer.error is not None
+                or len(answer.tail_hashes) != pending.pages
+            ):
+                answer = self._probe_body(pending.task)
+                self._bg_fallback += 1
+            answers.append(answer)
+        hit_pages = self._sync_restorable_prefixes(
+            [
+                (answer.restorable, pending.pages)
+                for (_, pending), answer in zip(entries, answers)
+            ]
         )
+        page = self.cache.page_size
+        for (rid, pending), answer, pages in zip(entries, answers, hit_pages):
+            del self._probe_pending[rid]
+            self._probe_triggers[pending.trigger] += 1
+            self._bg_consumed += 1
+            waited = self._pass_counter - pending.task.pass_no
+            self._bg_wait_passes += waited
+            self._bg_wait_max = max(self._bg_wait_max, waited)
+            if answer.no_probe:
+                continue
+            memo = _LookupMemo.from_lookup(
+                key_len=pending.key_len,
+                device_hit_len=pending.device_hit_len,
+                hit_pages=pages,
+                tail_hashes=answer.tail_hashes,
+                page_size=page,
+                swa_keys=answer.swa_keys,
+                has_mamba=answer.has_mamba,
+                probed_pass=pending.task.pass_no,
+            )
+            memo.last_verdict = self._last_verdicts.get(rid)
+            self._lookup_memo[rid] = memo
+        self._note_time("consume", time.monotonic() - start)
+
+    def _await_probe_answer(self, pending: _PendingProbe) -> _ProbeAnswer | None:
+        """Wait for this rank's own answer to an entry PP0 already has,
+        bounded like the drain.
+
+        Waiting lets a lagging worker catch up (its queued answers are still
+        wanted; falling back at once would waste them and keep it behind);
+        the drain's bound and progress line apply. On the deadline, or when
+        the worker dies meanwhile, the rank distrusts its worker -- every
+        later missing answer is probed synchronously at once -- and this
+        entry falls back. Non-fatal, unlike the drain: a probe is
+        reproducible.
+        """
+        start = time.monotonic()
+        deadline = start + _DRAIN_BLOCK_TIMEOUT_S
+        next_report = start + _DRAIN_REPORT_INTERVAL_S
+        pp_rank = getattr(self.cache, "pp_rank", 0)
+        while pending.answer is None and self._worker_alive():
+            try:
+                answer = self._probe_results.get_nowait()
+            except queue.Empty:
+                answer = None
+            if answer is not None:
+                self._file_probe_answer(answer)
+                continue
+            now = time.monotonic()
+            if now > deadline:
+                break
+            if now >= next_report:
+                logger.warning(
+                    "External cache linker: PP rank %s waiting %.0f s for its own "
+                    "probe answer (rid=%s seq=%d) behind PP0's frontier; "
+                    "worker_queue=%d",
+                    pp_rank,
+                    now - start,
+                    pending.task.rid,
+                    pending.task.seq,
+                    self._probe_tasks.qsize(),
+                )
+                next_report = now + _DRAIN_REPORT_INTERVAL_S
+            time.sleep(0.001)
+        if pending.answer is None:
+            self._probe_distrusted = True
+            logger.warning(
+                "External cache linker: probe worker on pp_rank=%s is distrusted "
+                "(%s after %.0f s waiting for rid=%s); missing answers are probed "
+                "synchronously from here",
+                pp_rank,
+                "no answer" if self._worker_alive() else "worker not alive",
+                time.monotonic() - start,
+                pending.task.rid,
+            )
+        return pending.answer
 
     def _early_load_budget(self, device_hit_len: int) -> int:
         """Device KV an early load may take: free plus evictable, less the pin.
@@ -1410,18 +2167,42 @@ class UnifiedCacheLinkerWrapper:
         ``_EARLY_LOAD_REPORT_FLOOR_S``, and at least one per
         ``_EARLY_LOAD_REPORT_INTERVAL_S`` of activity (the first decision
         reports at once), so a run's log shows whether early loads happen
-        and, if not, which gate refused them.
+        and, if not, which gate refused them. Since v6 ``_report`` prints
+        two lines (the counters, then the step timing window) and
+        ``on_pass_end`` calls it as a heartbeat when a minute passed with
+        no decision, so a line arrives every minute while the scheduler runs.
         """
         self._early_load_stats[outcome] += 1
         self._early_load_decisions += 1
         now = time.monotonic()
+        if self._report_due(now):
+            self._report(now)
+
+    def _report_due(self, now: float) -> bool:
+        """Whether the decision just booked is one the periodic line reports on."""
         since_last = now - self._early_load_last_report
         due_by_count = (
             self._early_load_decisions % _EARLY_LOAD_REPORT_EVERY == 0
             and since_last >= _EARLY_LOAD_REPORT_FLOOR_S
         )
-        if not due_by_count and since_last < _EARLY_LOAD_REPORT_INTERVAL_S:
-            return
+        return due_by_count or since_last >= _EARLY_LOAD_REPORT_INTERVAL_S
+
+    def _report(self, now: float) -> None:
+        """Print the counter line and the step-timing line; reset the window.
+
+        Line 1 is the early-load line with the deferred-probe totals
+        appended (``hash_ms`` / ``rpc_ms`` / ``sync_ms`` describe the
+        synchronous probes only, i.e. scheduler-thread cost, ``rpc_ms``
+        over the RPCs actually issued -- ``pp_skip``, after the v5 fields
+        so their run stays contiguous for the log parsers, counts the
+        synchronous probes a PP rank after the first took PP0's answer for
+        without one; ``triggers`` counts both paths). Line 2 is the window
+        since the last report:
+        per bucket the count, the wall sum (ms) and the max (ms);
+        ``events + walk + outside_* ~ window_s`` on a rank, counts are
+        rank-identical and the sums per rank, so the ranks' lines show the
+        straggler.
+        """
         self._early_load_last_report = now
         stats = self._early_load_stats
         # The backend's load queue depth, when it exposes one (Mooncake:
@@ -1430,6 +2211,8 @@ class UnifiedCacheLinkerWrapper:
         queued, executing = load_depth() if load_depth is not None else (-1, -1)
         recent = sorted(self._probe_recent)
         probe_p50 = recent[len(recent) // 2] if recent else 0.0
+        bg_recent = sorted(self._bg_rpc_recent)
+        bg_p50 = bg_recent[len(bg_recent) // 2] if bg_recent else 0.0
         logger.info(
             "External cache linker: early-load decisions=%d started=%d "
             "skipped_budget=%d skipped_inflight=%d skipped_pending=%d "
@@ -1441,7 +2224,12 @@ class UnifiedCacheLinkerWrapper:
             "probes=%d triggers new/refresh/age/shrink/grow=%d/%d/%d/%d/%d "
             "hash_ms mean=%.1f max=%.1f rpc_ms mean=%.1f p50=%.1f max=%.1f "
             "sync_ms mean=%.1f max=%.1f pass_matches=%d pass_probes=%d "
-            "pin_reserved=%d",
+            "pin_reserved=%d pp_skip=%d "
+            "bg submitted=%d consumed=%d sync_first=%d sync_held=%d fallback=%d "
+            "expired=%d stale=%d pending_now=%d frontier=%d worker_queue=%d "
+            "worker_alive=%s wait_passes mean=%.1f max=%d "
+            "bg_hash_ms mean=%.1f max=%.1f bg_rpc_ms mean=%.1f p50=%.1f max=%.1f "
+            "pass_submits=%d",
             self._early_load_decisions,
             stats[_EARLY_LOAD_STARTED],
             stats[_EARLY_LOAD_SKIPPED_BUDGET],
@@ -1467,7 +2255,7 @@ class UnifiedCacheLinkerWrapper:
             *self._probe_triggers.values(),
             self._probe_hash_s / max(self._probe_count, 1) * 1e3,
             self._probe_hash_max_s * 1e3,
-            self._probe_s / max(self._probe_count, 1) * 1e3,
+            self._probe_s / max(self._probe_count - self._probe_pp_skipped, 1) * 1e3,
             probe_p50 * 1e3,
             self._probe_max_s * 1e3,
             self._probe_sync_s / max(self._probe_count, 1) * 1e3,
@@ -1475,7 +2263,58 @@ class UnifiedCacheLinkerWrapper:
             self._last_pass_matches,
             self._last_pass_probes,
             self._pin_reserved_tokens,
+            self._probe_pp_skipped,
+            self._bg_submitted,
+            self._bg_consumed,
+            self._bg_sync_first,
+            self._bg_sync_held,
+            self._bg_fallback,
+            self._bg_expired,
+            self._bg_stale,
+            len(self._probe_pending),
+            self._probe_frontier(),
+            self._probe_tasks.qsize(),
+            self._worker_alive(),
+            self._bg_wait_passes / max(self._bg_consumed, 1),
+            self._bg_wait_max,
+            self._bg_hash_s / max(self._bg_answered, 1) * 1e3,
+            self._bg_hash_max_s * 1e3,
+            self._bg_rpc_s / max(self._bg_answered, 1) * 1e3,
+            bg_p50 * 1e3,
+            self._bg_rpc_max_s * 1e3,
+            self._last_pass_submits,
         )
+        timing = self._timing
+
+        def fields(bucket: str) -> tuple[int, float, float]:
+            total, longest, count = timing[bucket]
+            return count, total * 1e3, longest * 1e3
+
+        logger.info(
+            "External cache linker: step timing window_s=%.0f passes=%d "
+            "events n/sum/max=%d/%.0f/%.1f consume n/sum/max=%d/%.0f/%.1f "
+            "walk n/sum/max=%d/%.0f/%.1f "
+            "outside_none n/sum/max=%d/%.0f/%.1f outside_cold n/sum/max=%d/%.0f/%.1f "
+            "outside_hit n/sum/max=%d/%.0f/%.1f "
+            "evict n/tokens/sum/max=%d/%d/%.0f/%.1f load_back n/sum/max=%d/%.0f/%.1f "
+            "sync_probe n/sum/max=%d/%.0f/%.1f (pp_rank=%d)",
+            now - self._window_start,
+            self._timing_passes,
+            *fields("events"),
+            *fields("consume"),
+            *fields("walk"),
+            *fields("outside_none"),
+            *fields("outside_cold"),
+            *fields("outside_hit"),
+            timing["evict"][2],
+            self._evict_tokens,
+            timing["evict"][0] * 1e3,
+            timing["evict"][1] * 1e3,
+            *fields("load_back"),
+            *fields("sync_probe"),
+            getattr(self.cache, "pp_rank", 0),
+        )
+        self._reset_timing_window(now)
 
     # ---- init_load_back: remote -> device, then insert ----
 
@@ -1846,6 +2685,12 @@ class UnifiedCacheLinkerWrapper:
                     f"External linker load failed on pp_rank={pp_rank} for "
                     f"rids={rids}: {reason}"
                 )
+        if self._step_open:
+            # v6: the step-sync and drain phase ends here; the walk follows.
+            now = time.monotonic()
+            self._events_end = now
+            self._note_time("events", now - self._iter_start)
+            self._step_open = False
 
     def load_pending(self, rid: str) -> bool:
         """Whether a started load of the request's prefix tail is in flight.
@@ -1860,11 +2705,68 @@ class UnifiedCacheLinkerWrapper:
         ``dependent_load_index`` makes the batch wait on it. A store hit
         held this pass (refused by a cap, waiting for a slot rather than
         loading at admission) is pending too, until ``on_pass_end`` clears
-        the pass so the next one re-decides it.
+        the pass so the next one re-decides it. So is a request whose store
+        probe was deferred to the background worker (v6), until the agreed
+        answer is consumed into its memo or the memo age bound releases it
+        (``_probe_deferred``).
         """
         return self._track_dependencies and (
-            rid in self._load_index or rid in self._held_this_pass
+            rid in self._load_index
+            or rid in self._held_this_pass
+            or self._probe_deferred(rid)
         )
+
+    def _probe_deferred(self, rid: str) -> bool:
+        """Whether a deferred probe keeps ``rid`` out of admission.
+
+        Bounded by the memo age: a probe not agreed within
+        ``_LOOKUP_MEMO_MAX_AGE_PASSES`` releases the request to the walk,
+        whose ``match`` drops the entry and probes synchronously, so a hung
+        worker costs latency, never a stuck request. Reads only the
+        rank-identical deferral set and pass counter.
+        """
+        pending = self._probe_pending.get(rid)
+        return (
+            pending is not None
+            and self._pass_counter - pending.task.pass_no <= _LOOKUP_MEMO_MAX_AGE_PASSES
+        )
+
+    def _defer_probe(
+        self,
+        rid: str,
+        key: RadixKey,
+        device_hit_len: int,
+        tail_len: int,
+        last_hash: str | None,
+        trigger: str,
+    ) -> None:
+        """Hand one probe to the worker and register the request as deferred.
+
+        Called from ``match`` under the deferral rule, so the entry, its
+        position and its ``seq`` are the same on every PP rank; at most one
+        entry per rid, since ``match`` defers only a rid without one.
+        """
+        self._probe_seq += 1
+        task = _ProbeTask(
+            seq=self._probe_seq,
+            generation=self._probe_generation,
+            rid=rid,
+            key=key,
+            start=device_hit_len,
+            stop=device_hit_len + tail_len,
+            last_hash=last_hash,
+            pass_no=self._pass_counter,
+        )
+        self._probe_pending[rid] = _PendingProbe(
+            task=task,
+            key_len=len(key),
+            device_hit_len=device_hit_len,
+            pages=tail_len // self.cache.page_size,
+            trigger=trigger,
+        )
+        self._probe_tasks.put(task)
+        self._pass_submits += 1
+        self._bg_submitted += 1
 
     def dependent_load_index(self, reqs: Sequence[Req], started_index: int) -> int:
         """Layer-counter index a batch of ``reqs`` must wait on, or -1.
@@ -1973,6 +2875,32 @@ class UnifiedCacheLinkerWrapper:
         self._probe_s = self._probe_max_s = 0.0
         self._probe_recent.clear()
         self._probe_sync_s = self._probe_sync_max_s = 0.0
+        self._probe_pp_skipped = 0
+        # v6: the deferral set is forgotten and the generation moves on, so
+        # a late answer of the old generation is dropped when filed; both
+        # queues are emptied (the worker may be mid-probe: its answer is
+        # then stale). The totals and the timing window start over.
+        self._probe_generation += 1
+        self._probe_pending.clear()
+        for pending_queue in (self._probe_tasks, self._probe_results):
+            while True:
+                try:
+                    pending_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self._pass_submits = self._last_pass_submits = 0
+        self._bg_submitted = self._bg_consumed = 0
+        self._bg_sync_first = self._bg_sync_held = 0
+        self._bg_fallback = self._bg_expired = self._bg_stale = 0
+        self._bg_wait_passes = self._bg_wait_max = self._bg_answered = 0
+        self._bg_hash_s = self._bg_hash_max_s = 0.0
+        self._bg_rpc_s = self._bg_rpc_max_s = 0.0
+        self._bg_rpc_recent.clear()
+        self._reset_timing_window(time.monotonic())
+        self._step_open = False
+        self._iter_start = self._events_end = self._last_pass_end = None
+        self._prev_admitted = 0
+        self._prev_admitted_hit = False
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -2004,6 +2932,8 @@ class UnifiedCacheLinkerWrapper:
         # unlocked now, one still in flight is unlocked by the drain.
         self._release_early_pin(rid)
         self._forget_hold(rid)
+        # A deferred probe for it has no consumer; its late answer is stale.
+        self._probe_pending.pop(rid, None)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.
         if self.cache_linker.cancel_queued_load(rid):
@@ -2013,5 +2943,11 @@ class UnifiedCacheLinkerWrapper:
             self._load_index.pop(rid, None)
 
     def close(self) -> None:
+        if self._probe_worker is not None:
+            # The worker must not be mid-RPC on a closed client: sentinel,
+            # then join within the drain's bound (the backend joins its own
+            # workers the same way before closing the store).
+            self._probe_tasks.put(None)
+            self._probe_worker.join(timeout=_DRAIN_BLOCK_TIMEOUT_S)
         self.cache_linker.close()
         self._release_pending_locks()

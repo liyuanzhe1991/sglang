@@ -170,3 +170,22 @@ Code / repo:
 Measured but out of scope for this patch: on our fleet the remaining gap to the model (−3 %) is arrival burstiness
 (the replay harness releases ~53 lanes at once; waves of 16–88 arrivals per 30 s) and per-DP-rank KV imbalance on the
 decode nodes — not the prefill node.
+
+## v6 and v7 (2026-10-22)
+
+**v6 — store probes off the scheduler thread.** Every probe after a pass's first (tail hash + Mooncake store lookup RPC)
+runs on one worker thread per rank; the request stays out of admission through the existing `load_pending` gate until its
+answer is consumed, behind a frontier agreed on PP rank 0 over the existing per-step collective (no new collectives;
+a crc of the pending rids on the rank check). Held hits' refresh probes stay synchronous. PP ranks after the first skip the
+synchronous store RPC and adopt rank 0's mask. Step-timing buckets (`events / consume / walk / outside_*`) are printed every
+60 s. Measured on the c128 replay: long pauses (> 0.3 s) 0.27 → 0.07 of wall, cold prefill 5.8k → 7.2k tok/s, +21 % output.
+
+**v7 — the per-chunk KV send no longer idles the GPU.** In `event_loop_pp_disagg_prefill`, `process_prefill_chunk` ran the
+previous chunk's `send_kv_chunk` before the next micro-batch was launched; its `kv_to_page_indices` `.cpu()` sat on the
+schedule stream behind the proxy send's `wait_event(launch_event)` (default `SGLANG_PP_COMM_OVERLAP` off), so it returned
+only when the forward ended and every piece of CPU work after it ran with the GPU empty (period 143 ms vs 108 ms forward).
+That wait was also the only write-before-RDMA-read ordering for Mooncake, so it is moved, not removed:
+`process_prefill_chunk(defer_send=True)` hands the chunked request back; the loop records an event on `forward_stream`
+right before `_pp_launch_batch` and, right after the launch, `_pp_send_pending_kv` waits on it and sends the chunk and the
+batch requests' cached prefixes in the old order. `run_batch`'s early prefix send is limited to `pp_size == 1`. The last
+rank keeps its output fence until `--pp-async-batch-depth 1` is set, which the explicit event makes safe.

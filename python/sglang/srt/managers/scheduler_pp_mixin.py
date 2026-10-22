@@ -10,7 +10,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    is_aborted,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -281,8 +284,10 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
+                deferred_chunk_req = self.process_prefill_chunk(
+                    last_batch=self.last_batch,
+                    running_batch=self.running_batch,
+                    defer_send=True,
                 )
                 self._process_hicache_events()
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
@@ -306,6 +311,11 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_proxy_send_work()
+                # The tail of forward_stream here is the end of the previous
+                # forward: the one that wrote the deferred chunk and every
+                # cached prefix page to be sent this iteration.
+                kv_send_ready = self.device_module.Event()
+                kv_send_ready.record(self.forward_stream)
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
@@ -316,6 +326,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                self._pp_send_pending_kv(deferred_chunk_req, cur_batch, kv_send_ready)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -1753,6 +1764,32 @@ class SchedulerPPMixin:
                         )
                     )
         return result, event
+
+    def _pp_send_pending_kv(
+        self: Scheduler,
+        chunk_req: Optional[Req],
+        cur_batch: Optional[ScheduleBatch],
+        forward_done,
+    ) -> None:
+        """Send this iteration's KV after the launch. The .cpu() inside
+        kv_to_page_indices still waits for the forward that wrote the pages
+        (the explicit wait_event below), but the next forward is already
+        enqueued behind it, so the GPU no longer idles through the wait.
+        Same order as before: the chunked request's chunk, then each batch
+        request's cached prefix."""
+        if chunk_req is None and cur_batch is None:
+            return
+        self.device_module.current_stream().wait_event(forward_done)
+        if chunk_req is not None and not is_aborted(chunk_req):
+            # Nothing sends for this request between process_prefill_chunk and
+            # here, so start_send_idx is unchanged; a D-side cursor already past
+            # tmp_end_idx (long decode-cached prefix) is skipped in _send_kv_chunk.
+            self.send_kv_chunk(
+                chunk_req, last_chunk=False, end_idx=chunk_req.tmp_end_idx
+            )
+        if cur_batch is not None:
+            for req in cur_batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

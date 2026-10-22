@@ -4421,7 +4421,12 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        # Under PP the send moves after the launch (_pp_send_pending_kv) so its
+        # host sync does not sit between batch formation and the kernel enqueue.
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and get_parallel().pp_size == 1
+        ):
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 

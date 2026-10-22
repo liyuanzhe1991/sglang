@@ -1243,7 +1243,12 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
-    ) -> None:
+        defer_send: bool = False,
+    ) -> Optional[Req]:
+        # defer_send: the PP loop sends this chunk's KV after the next launch
+        # (_pp_send_pending_kv), so the host sync inside kv_to_page_indices
+        # overlaps the running forward instead of idling the GPU before it.
+        deferred: Optional[Req] = None
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
@@ -1259,12 +1264,19 @@ class SchedulerDisaggregationPrefillMixin:
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif self.enable_overlap or defer_send:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
+                # Under overlap the result path sends it; hand it back only
+                # when nothing else will, or the chunk would go out twice.
+                # Unified memory (unused here): the rid enters
+                # disagg_prefill_pending_chunk_rids only at the deferred send;
+                # add it here first if that mode is ever enabled with PP.
+                if defer_send and not self.enable_overlap:
+                    deferred = req
             else:
                 self.send_kv_chunk(req)
 
@@ -1281,6 +1293,8 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+        return deferred
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
