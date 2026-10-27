@@ -53,7 +53,7 @@ device_module = get_device_module()
 # micro-benchmark (loader_bench.py) without redesign; the pybind client's
 # thread safety and its GIL release during a get are assumed, not verified
 # (README, open risks).
-_LOAD_WORKERS = 3
+_LOAD_WORKERS = 1  # v8 diagnostic: was 3 (see unified_cache_linker._EARLY_LOAD_MAX_INFLIGHT)
 # Layers per ``batch_get_into_multi_buffer_ranges`` call. A page's store
 # object is packed across this rank's layers, so a group's layers are
 # contiguous sub-ranges of the same object and one call carries them all,

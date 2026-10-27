@@ -111,7 +111,9 @@ _LOOKUP_MEMO_MAX_AGE_PASSES = 300
 # worse than v3's eight); a test pins the pair. The device KV held for
 # requests not yet admitted is bounded separately, by
 # ``_EARLY_PINNED_MAX_FRACTION``.
-_EARLY_LOAD_MAX_INFLIGHT = 12
+# v8 diagnostic (2026-10-23): one load worker, four in flight — throttles early-load DMA bursts to one at a time
+# to test whether the multi-second whole-pipeline stall episodes follow the load volume. Revert with the result.
+_EARLY_LOAD_MAX_INFLIGHT = 4
 # Share of the FULL device pool that early loads may hold pinned for requests
 # not yet admitted. The pin is the lock on the loaded endpoint, which in the
 # tree core protects the whole root-to-endpoint path, so what is counted and
