@@ -418,6 +418,7 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 
 @register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutlass")
+@register_fused_func("flashinfer_rdma", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -439,6 +440,9 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
     )
 
+    # Both transports provide global expert IDs and an EP-partial output
+    # buffer. enable_alltoall selects that CUTLASS layout; the dispatcher owns
+    # the actual NVLink or RDMA communication.
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,
@@ -479,6 +483,33 @@ def fused_experts_none_to_flashinfer_mxfp4(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
     )
+
+
+@register_fused_func("flashinfer_rdma", "flashinfer_mxfp4")
+def fused_experts_rdma_to_flashinfer_mxfp4(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    if not isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        raise TypeError(
+            "FlashInfer RDMA native MXFP4 requires the SM120 CUTLASS runner"
+        )
+    if dispatch_output.hidden_states.dtype != torch.bfloat16:
+        raise TypeError("Native MXFP4 RDMA bridge must provide dequantized BF16 rows")
+    # Decode rows retain global expert IDs and unit weights. Prefill retains
+    # original route weights. The existing EP finalize also zeros padding rows.
+    result = _fused_experts_flashinfer_mxfp4_cutlass(
+        StandardDispatchOutput(
+            dispatch_output.hidden_states, None, dispatch_output.topk_output
+        ),
+        quant_info,
+        runner_config,
+    )
+    return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 
 def _fused_experts_flashinfer_mxfp4_cutlass(
