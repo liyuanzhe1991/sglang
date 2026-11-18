@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
-from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.runtime_context import get_parallel, get_resources, get_spec
 
 _BUFFER_KEY = "flashinfer_rdma_alltoall"
 logger = logging.getLogger(__name__)
@@ -203,6 +203,12 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
         self.topk = router_topk
         self.hidden = hidden_size
         self.capacity = max_tokens_per_rank
+        # Ranks may run different verify widths in these modes, so the published
+        # DP sizes do not bound what a rank receives; keep capacity-sized rows.
+        self.rows_follow_batch = (
+            envs.SGLANG_RAGGED_VERIFY_MODE.get() == "static"
+            and not get_spec().speculative_adaptive
+        )
         self.wire_dtype = envs.SGLANG_FLASHINFER_RDMA_WIRE_DTYPE.get()
         if self.wire_dtype not in ("nvfp4", "bf16"):
             raise ValueError("FlashInfer RDMA wire dtype must be nvfp4 or bf16")
@@ -316,6 +322,27 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
     def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
         raise ValueError("FlashInfer RDMA requires serial dispatch/compute/combine")
 
+    def _live_rows(self, tokens):
+        """Compact rows this rank can receive in one decode/verify forward.
+
+        Every token row of the round reaches at most top-k experts, so the sum
+        of the ranks' rows times top-k bounds what any rank receives. Sizing the
+        expert-compute rows by it, instead of by the start-up capacity, keeps
+        pack/GEMM/unpack proportional to the batch that actually runs.
+        """
+        full = self.state.packed.shape[0]
+        sizes = get_dp_global_num_tokens()
+        # The published sizes describe this forward only if they carry this
+        # rank's own row count (the check _prefill_dispatch makes).
+        if (
+            not self.rows_follow_batch
+            or sizes is None
+            or len(sizes) != self.group.size()
+            or sizes[self.ep_rank] != tokens
+        ):
+            return full
+        return min(max(int(sum(sizes)), 1) * self.topk, full)
+
     def dispatch(self, hidden_states, topk_output):
         if self._pending is not None or self.state.owner is not None:
             raise RuntimeError(
@@ -385,32 +412,33 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
                 out=state.outputs,
                 return_recv_hook=False,
             )
+        rows = self._live_rows(hidden_states.shape[0])
+        packed = state.packed[:rows]
+        packed_sf = state.packed_sf[:rows]
+        compact_ids = state.ids[:rows]
+        compact_weights = state.weights[:rows]
         pack_expert_rows(
             recv,
             recv_sf,
             counts,
-            state.packed,
-            state.packed_sf,
-            state.ids,
-            state.weights,
-            state.slot_map,
+            packed,
+            packed_sf,
+            compact_ids,
+            compact_weights,
+            state.slot_map[:rows],
             ep_rank=self.ep_rank,
             num_experts=self.num_experts,
         )
         if self.native_mxfp4:
-            packed = (
-                state.buffer.dequantize_nvfp4_to_bf16(
-                    state.packed, self.packed_global_scales, state.packed_sf
+            if self.wire_dtype == "nvfp4":
+                packed = state.buffer.dequantize_nvfp4_to_bf16(
+                    packed, self.packed_global_scales[:rows], packed_sf
                 )
-                if self.wire_dtype == "nvfp4"
-                else state.packed
-            )
             packed_sf = None
         else:
             from flashinfer import nvfp4_block_scale_interleave
 
-            packed = state.packed
-            packed_sf = nvfp4_block_scale_interleave(state.packed_sf)
+            packed_sf = nvfp4_block_scale_interleave(packed_sf)
         self._pending = ("decode", ids, weights, handle, hidden_states.shape[0])
         state.owner = self
         # Compact rows use unit weights. Original routing weights are applied
@@ -418,8 +446,8 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
         return FlashinferDispatchOutput(
             packed,
             packed_sf,
-            StandardTopKOutput(state.weights, state.ids, None),
-            state.compact_output,
+            StandardTopKOutput(compact_weights, compact_ids, None),
+            state.compact_output[:rows],
             torch.bfloat16,
         )
 

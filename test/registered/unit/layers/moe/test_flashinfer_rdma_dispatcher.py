@@ -55,6 +55,10 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
         with (
             patch(f"{MODULE}.get_parallel", return_value=parallel),
             patch(
+                f"{MODULE}.get_spec",
+                return_value=SimpleNamespace(speculative_adaptive=False),
+            ),
+            patch(
                 f"{MODULE}.dist.get_process_group_ranks", return_value=list(range(4))
             ),
             patch(f"{MODULE}.dist.all_reduce") as reduce,
