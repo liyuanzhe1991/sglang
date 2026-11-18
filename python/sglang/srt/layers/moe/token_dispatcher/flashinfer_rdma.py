@@ -133,8 +133,9 @@ def _shared_state(group, *, hidden, num_experts, topk, capacity, wire_dtype):
             torch.empty((local_experts, cap), dtype=torch.int32, device=device),
             torch.empty((local_experts, ep), dtype=torch.int64, device=device),
         ),
-        packed=torch.empty((rows, width), dtype=dtype, device=device),
-        packed_sf=torch.empty((rows, sf_width), dtype=torch.uint8, device=device),
+        # pack_expert_rows writes only rows that carry data; start from zeros.
+        packed=torch.zeros((rows, width), dtype=dtype, device=device),
+        packed_sf=torch.zeros((rows, sf_width), dtype=torch.uint8, device=device),
         ids=torch.empty((rows, 1), dtype=torch.int32, device=device),
         weights=torch.empty((rows, 1), dtype=torch.float32, device=device),
         slot_map=torch.empty(rows, dtype=torch.int32, device=device),
@@ -439,7 +440,7 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
             from flashinfer import nvfp4_block_scale_interleave
 
             packed_sf = nvfp4_block_scale_interleave(packed_sf)
-        self._pending = ("decode", ids, weights, handle, hidden_states.shape[0])
+        self._pending = ("decode", ids, weights, handle, hidden_states.shape[0], counts)
         state.owner = self
         # Compact rows use unit weights. Original routing weights are applied
         # exactly once, by combine after expert computation.
@@ -496,11 +497,12 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
                 unpack_expert_rows,
             )
 
-            _, ids, weights, handle, tokens = pending
+            _, ids, weights, handle, tokens, counts = pending
             state = self.state
             unpack_expert_rows(
                 combine_input.hidden_states,
                 state.slot_map,
+                counts,
                 state.expert_output,
                 state.combine_scales,
             )
