@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
@@ -47,6 +48,8 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+_FP8_PREFILL_WIDE_BLOCK = envs.SGLANG_DSA_TILELANG_FP8_PREFILL_WIDE_BLOCK.get()
+_FP8_PREFILL_WIDE_BLOCK_MIN_ROWS = 1024
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
@@ -912,6 +915,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     block_I=64,
     inner_iter=1,
     threads=256,
+    h_per_block=16,
 ):
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
@@ -941,9 +945,8 @@ def sparse_mla_fwd_decode_partial_fp8(
     else:
         sm_scale = sm_scale * 1.44269504
 
-    h_per_block = 16
-    # Match bf16 partial behavior: keep fixed 16-head tiles and use
-    # sliced T.copy on H0:H1 for tail handling.
+    # Match bf16 partial behavior: keep fixed head tiles (16 unless the caller
+    # asks for more) and use sliced T.copy on H0:H1 for tail handling.
     assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
         "num_heads must be <=16 or divisible by 16"
     )
@@ -1194,6 +1197,7 @@ def tilelang_sparse_fwd(
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     if _is_hip or is_fp8_kv:
+        h_per_block = 16
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
@@ -1206,6 +1210,19 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            if (
+                _FP8_PREFILL_WIDE_BLOCK
+                and not _is_hip
+                and q.shape[0] >= _FP8_PREFILL_WIDE_BLOCK_MIN_ROWS
+                and num_heads == 64
+                and topk % 96 == 0
+            ):
+                # Prefill-sized batch: one block per token holds all 64 heads, so
+                # each selected KV row is gathered once instead of once per
+                # 16-head tile, and the single key group needs no combine pass.
+                block_I, threads, h_per_block = 96, 256, 64
+                ni = topk // block_I
+                inner_iter = ni
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1215,6 +1232,7 @@ def tilelang_sparse_fwd(
                 block_I=block_I,
                 inner_iter=inner_iter,
                 threads=threads,
+                h_per_block=h_per_block,
             )
         else:
             if _is_gfx95_supported:
@@ -1237,6 +1255,9 @@ def tilelang_sparse_fwd(
             q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
         )
         n_groups = ni // inner_iter
+        if h_per_block != 16:
+            # One key group: the partial output is already normalised.
+            return partial_o_batched[:, :, 0]
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,
             d_v,
