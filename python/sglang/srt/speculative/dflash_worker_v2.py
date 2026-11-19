@@ -2668,11 +2668,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
                     batch, self._target_worker, defer_metadata_init=True
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                # The idle rank replays the verify graph of the bucket the
+                # active ranks replay, with padding rows only, as an idle rank
+                # does in plain decode, so the active ranks keep their graph.
+                # NPU keeps the eager verify (see the idle guard below).
+                if _is_npu:
+                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -3085,12 +3086,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
+        # Idle-DP guard, NPU only: there an idle rank runs an eager verify with
+        # raw scheduler counts while a graph-replaying rank assumes the padded
+        # bucket, so their DP-gather segment offsets disagree. Elsewhere the
+        # idle rank replays the same graph bucket (see the idle branch above).
         if (
-            get_parallel().attn_dp_enabled
+            _is_npu
+            and get_parallel().attn_dp_enabled
             and verify_forward_batch.original_global_num_tokens_cpu is not None
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):
