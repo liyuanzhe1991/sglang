@@ -1052,7 +1052,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # full qkv width matches the decode path and saves two kernel launches.
         split_size = (
             layer.q_dim
-            if self.kernel_dispatcher.prefill_backend.is_flashinfer()
+            if (
+                self.kernel_dispatcher.prefill_backend.is_flashinfer()
+                or envs.SGLANG_KDA_PREFILL_FLASHINFER_SM120.get()
+            )
             and layer.q_dim == layer.k_dim == layer.v_dim
             else 0
         )

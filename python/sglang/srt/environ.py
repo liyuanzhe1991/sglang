@@ -1943,6 +1943,9 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # SM120: single-sequence KDA extends of at least 1024 tokens run FlashInfer's
+    # CuTe DSL prefill kernel instead of the Triton chain.
+    SGLANG_KDA_PREFILL_FLASHINFER_SM120 = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
