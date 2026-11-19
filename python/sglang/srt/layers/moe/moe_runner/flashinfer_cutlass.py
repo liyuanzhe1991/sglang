@@ -69,6 +69,10 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_limit: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
     pair_w2_weight: Optional[torch.Tensor] = None
+    # (w13_gs, a13_gs, w2_gs, a2_gs, swiglu_limit) when w13 is stored
+    # [gate; up] for FlashInfer's SM12x W4A4 kernel; CUTLASS cannot read that
+    # layout.
+    sm120_w4a4_params: Optional[tuple] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -341,6 +345,30 @@ def _run_flashinfer_cutlass(
             return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
     if quant_info.pair_w2_weight is not None:
         raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
+
+    if quant_info.sm120_w4a4_params is not None:
+        if (
+            x_sf is not None
+            or output is not None
+            or enable_alltoall
+            or x.dtype != torch.bfloat16
+            or output_dtype != torch.bfloat16
+        ):
+            raise RuntimeError(
+                "The SM12x W4A4 MoE kernel needs BF16 activations of local experts"
+            )
+        from sglang.kernels.ops.gemm.sm120_nvfp4_w4a4_moe import nvfp4_w4a4_moe
+
+        return nvfp4_w4a4_moe(
+            x,
+            quant_info.w13_weight,
+            quant_info.quant_scales[1],
+            quant_info.w2_weight,
+            quant_info.quant_scales[4],
+            quant_info.sm120_w4a4_params,
+            topk_ids,
+            topk_weights,
+        )
 
     if output is None:
         with use_symmetric_memory(

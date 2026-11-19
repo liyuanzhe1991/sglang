@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -69,10 +69,16 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_exec, get_platform
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_platform,
+    get_schedule,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.device import get_device_capability, is_cuda
+from sglang.srt.utils.device import get_device_capability, is_cuda, is_sm120
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -2958,6 +2964,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 int(layer.num_local_experts),
                 layer.w13_weight.device,
             )
+            if self._use_sm120_w4a4_prefill_moe:
+                from sglang.kernels.ops.gemm.sm120_nvfp4_w4a4_moe import (
+                    w4a4_swiglu_limit,
+                )
+
+                # CUTLASS folds the activation scale into its GEMM alphas; the
+                # SM12x kernel takes the per-expert weight scales alone.
+                copy_or_rebind_param(
+                    layer,
+                    "sm120_w4a4_w13_scale",
+                    (layer.g1_alphas * layer.w13_input_scale_quant).to(torch.float32),
+                )
+                copy_or_rebind_param(
+                    layer,
+                    "sm120_w4a4_w2_scale",
+                    (layer.g2_alphas * layer.w2_input_scale_quant).to(torch.float32),
+                )
+                layer._sm120_w4a4_swiglu_limit = w4a4_swiglu_limit(
+                    layer._cutlass_swiglu_params
+                )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
@@ -3097,6 +3123,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_blockscale_swizzled,
             )
 
+            if self._use_sm120_w4a4_prefill_moe:
+                from sglang.kernels.ops.gemm.sm120_nvfp4_w4a4_moe import (
+                    warm_up_w4a4_moe,
+                )
+
+                warm_up_w4a4_moe(
+                    layer.w13_weight,
+                    layer.w13_blockscale_swizzled,
+                    layer.w2_weight,
+                    layer.w2_blockscale_swizzled,
+                    self._sm120_w4a4_params(layer),
+                    layer.moe_runner_config.top_k,
+                    max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens,
+                )
+
             if self._is_cutedsl_v2_standard:
                 # CuteDSL v2 only: convert blockscales to MMA layout for
                 # CuteDslMoEWrapper.  The v1 (deepep) path uses the
@@ -3143,14 +3184,59 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
+    # Decided once: it fixes the row order of w13 at load, and CUTLASS cannot
+    # read [Gate, Up] rows afterwards.
+    @cached_property
+    def _use_sm120_w4a4_prefill_moe(self) -> bool:
+        """PD prefill routed experts through FlashInfer's SM12x W4A4 kernel."""
+        if not envs.SGLANG_MOE_PREFILL_FLASHINFER_SM120_W4A4.get():
+            return False
+        config = self.moe_runner_config
+        supported = (
+            self.enable_flashinfer_cutlass_moe
+            and config.is_gated
+            and config.activation == "silu"
+            and config.moe_ep_size == config.moe_tp_size == 1
+            and not config.num_fused_shared_experts
+            and get_moe_a2a_backend().is_none()
+            and get_disagg().disaggregation_mode == "prefill"
+            and not self.quant_config.use_per_token_activation
+            # The kernel sums the expert outputs with atomic adds and has only
+            # the default NVFP4 activation quantizer.
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not envs.FLASHINFER_NVFP4_4OVER6.get()
+            and is_sm120()
+        )
+        if not supported:
+            logger.warning_once(
+                "SGLANG_MOE_PREFILL_FLASHINFER_SM120_W4A4 is ignored: it needs a "
+                "PD prefill engine on SM120 with local gated NVFP4 experts."
+            )
+        return supported
+
+    @staticmethod
+    def _sm120_w4a4_params(layer: torch.nn.Module) -> tuple:
+        """(w13_gs, a13_gs, w2_gs, a2_gs, swiglu_limit) of the SM12x kernel."""
+        return (
+            layer.sm120_w4a4_w13_scale,
+            layer.w13_input_scale_quant.reshape(1),
+            layer.sm120_w4a4_w2_scale,
+            layer.w2_input_scale_quant.reshape(1),
+            layer._sm120_w4a4_swiglu_limit,
+        )
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Only weights and block scales follow the kernel's physical row order;
-        # per-tensor global scales always remain [Gate, Up]. MegaMoE and
-        # CuteDSL v1 (deepep) consume canonical [Gate, Up] weights as well.
+        # per-tensor global scales always remain [Gate, Up]. MegaMoE, CuteDSL v1
+        # (deepep) and the SM12x W4A4 kernel consume canonical [Gate, Up] weights
+        # as well.
         return self.moe_runner_config.is_gated and (
             self.use_flashinfer_trtllm_weight_layout
-            or self.enable_flashinfer_cutlass_moe
+            or (
+                self.enable_flashinfer_cutlass_moe
+                and not self._use_sm120_w4a4_prefill_moe
+            )
             or self._is_cutedsl_v2_standard
         )
 
@@ -3407,6 +3493,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
                 apply_routed_scaling_factor=False,
+                sm120_w4a4_params=(
+                    self._sm120_w4a4_params(layer)
+                    if self._use_sm120_w4a4_prefill_moe
+                    else None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 

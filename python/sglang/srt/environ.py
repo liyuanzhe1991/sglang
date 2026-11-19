@@ -1403,6 +1403,10 @@ class Envs:
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Run the gated NVFP4 routed experts of a PD prefill engine with FlashInfer's
+    # SM12x W4A4 CuTe DSL kernel instead of CUTLASS (flashinfer_cutlass runner,
+    # all experts local); w13 is then loaded [Gate, Up]. Validated only on SM120.
+    SGLANG_MOE_PREFILL_FLASHINFER_SM120_W4A4 = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
