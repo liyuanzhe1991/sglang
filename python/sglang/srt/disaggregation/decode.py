@@ -4227,6 +4227,16 @@ class SchedulerDisaggregationDecodeMixin:
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         batch = self._get_new_prebuilt_batch(running_batch)
+        if getattr(self, "decode_start_gate", None) is True:
+            # Opened by this iteration's ingest pass, on every rank: the call
+            # above admitted what waited. Later arrivals wait for the next open.
+            self.decode_start_gate = False
+            logger.info(
+                "Decode start gate opened: "
+                f"admitted {0 if batch is None else len(batch.reqs)}, "
+                f"still waiting {len(self.waiting_queue)}, "
+                f"running before {running_batch.batch_size()}"
+            )
         if batch is None:
             return None
         nonblocking = self._nonblocking_admit_in_scope(batch)
@@ -4395,8 +4405,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
+        # Start gate closed: only a request that ran before (retracted, then
+        # resumed) or a health probe goes on.
+        hold = getattr(self, "decode_start_gate", None) is False
 
         for req in self.waiting_queue:
+            if hold and req.retraction_count == 0 and not is_health_check_req(req):
+                continue
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
             if len(can_run_list) < num_not_used_batch and (

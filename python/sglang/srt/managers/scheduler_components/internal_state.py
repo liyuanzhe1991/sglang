@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -184,6 +185,9 @@ class SchedulerInternalStateController:
             "dspark_clear_info_records": _UpdateHandler(
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
+            "disagg_decode_start_gate": _UpdateHandler(
+                self._validate_decode_start_gate, self._apply_decode_start_gate
+            ),
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
@@ -233,6 +237,26 @@ class SchedulerInternalStateController:
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
             self.scheduler.draft_worker.clear_info_records()
+
+    def _validate_decode_start_gate(self, key: str, value: Any) -> None:
+        # The ranks open in one iteration only because global rank 0 broadcasts
+        # the request to all of them in the same ingest pass: one TP group,
+        # no DP replicas, no PP stages, no local control broadcast.
+        parallel = get_parallel()
+        if (
+            self.scheduler.disaggregation_mode != DisaggregationMode.DECODE
+            or parallel.dp_size > 1
+            or parallel.pp_size > 1
+            or parallel.enable_dp_attention_local_control_broadcast
+        ):
+            raise UpdateRejected(f"Updating {key} is not supported on this engine.")
+
+    def _apply_decode_start_gate(self, key: str, value: Any) -> None:
+        # Scheduler state, not a server arg: keep it out of the override.
+        # 1: every rank admits what waits with its KV in this iteration, then
+        # holds later arrivals until the next 1 (see get_new_prebuilt_batch).
+        # 0: no gate.
+        self.scheduler.decode_start_gate = True if value else None
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
         if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(
