@@ -1328,6 +1328,9 @@ class Envs:
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
+    # Prefill: weight shapes "OUTxIN,OUTxIN" of unquantized (BF16) linears that get a block-FP8 copy
+    # (128x128 blocks, DeepGEMM) at load, used for GEMMs of at least 1024 rows. Empty disables.
+    SGLANG_PREFILL_FP8_PROJ_SHAPES = EnvStr("")
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
     SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)

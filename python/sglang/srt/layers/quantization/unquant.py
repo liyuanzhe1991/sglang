@@ -101,6 +101,28 @@ if _is_gfx95:
         quantize_weight as quantize_fp8w_weight,
     )
 
+# Unquantized weight shapes that get a block-FP8 copy for prefill-width GEMMs
+# (SGLANG_PREFILL_FP8_PROJ_SHAPES); smaller batches keep the BF16 weight.
+_prefill_fp8_weight_shapes = frozenset(
+    tuple(int(dim) for dim in shape.split("x"))
+    for shape in envs.SGLANG_PREFILL_FP8_PROJ_SHAPES.get().split(",")
+    if shape.strip()
+)
+_PREFILL_FP8_MIN_ROWS = 1024
+
+
+def _quantize_prefill_fp8_weight(weight: torch.Tensor):
+    """Block-FP8 copy (128x128 blocks) of a BF16 weight with the packed UE8M0
+    scales DeepGEMM takes."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        quant_weight_ue8m0,
+        transform_scale_ue8m0,
+    )
+
+    qweight, scale = quant_weight_ue8m0(weight, [128, 128])
+    return qweight.contiguous(), transform_scale_ue8m0(scale, mn=qweight.shape[-2])
+
+
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
@@ -929,6 +951,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and tuple(layer.weight.shape) in _gfx950_fp8w_weight_shapes
             else None
         )
+        # Block-FP8 copy beside the BF16 weight; remade on every weight load.
+        layer.prefill_fp8_weight = (
+            _quantize_prefill_fp8_weight(layer.weight.data)
+            if _prefill_fp8_weight_shapes
+            and type(layer.weight.data) is torch.Tensor
+            and layer.weight.dtype == torch.bfloat16
+            and tuple(layer.weight.shape) in _prefill_fp8_weight_shapes
+            else None
+        )
 
     def apply(
         self,
@@ -936,6 +967,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        prefill_fp8 = getattr(layer, "prefill_fp8_weight", None)
+        if (
+            prefill_fp8 is not None
+            and bias is None
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.numel() // x.shape[-1] >= _PREFILL_FP8_MIN_ROWS
+        ):
+            from sglang.srt.layers.quantization.fp8_utils import (
+                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            return deepgemm_w8a8_block_fp8_linear_with_fallback(
+                x,
+                prefill_fp8[0],
+                [128, 128],
+                prefill_fp8[1],
+                input_scale=None,
+                act_scale_ue8m0=True,
+            )
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
